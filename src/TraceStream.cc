@@ -1251,10 +1251,10 @@ TraceWriter::TraceWriter(const std::string& file_name, int bind_to_cpu,
   }
   unlink(version_clone_path.c_str());
 
-  if (!probably_not_interactive(STDOUT_FILENO)) {
+  //if (!probably_not_interactive(STDOUT_FILENO)) {
     printf("rr: Saving execution to trace directory `%s'.\n",
            trace_dir.c_str());
-  }
+  //}
 }
 
 void TraceWriter::make_latest_trace() {
