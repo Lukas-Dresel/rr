@@ -97,6 +97,8 @@ struct FcntlConstants {
     OFD_SETLKW = 38,
     // Other Linux-specific operations
     DUPFD_CLOEXEC = 0x400 + 6,
+    SETPIPE_SZ = 0x400 + 7,
+    GETPIPE_SZ = 0x400 + 8,
     ADD_SEALS = 0x400 + 9,
     GET_RW_HINT = 0x400 + 11,
     SET_RW_HINT = 0x400 + 12,
@@ -185,6 +187,12 @@ struct WordSize32Defs {
     uint32_t d_val;
   } ElfDyn;
   RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf32_Dyn, ElfDyn);
+  typedef struct {
+    uint32_t n_namesz;
+    uint32_t n_descsz;
+    uint32_t n_type;
+  } ElfNhdr;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf32_Nhdr, ElfNhdr);
 };
 
 struct WordSize64Defs {
@@ -258,6 +266,12 @@ struct WordSize64Defs {
     uint64_t d_val;
   } ElfDyn;
   RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf64_Dyn, ElfDyn);
+  typedef struct {
+    uint32_t n_namesz;
+    uint32_t n_descsz;
+    uint32_t n_type;
+  } ElfNhdr;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf64_Nhdr, ElfNhdr);
 };
 
 /**

@@ -382,6 +382,7 @@ set(RR_SOURCES
   src/test/cpuid_loop.S
   src/AddressSpace.cc
   src/AutoRemoteSyscalls.cc
+  src/BuildidCommand.cc
   src/Command.cc
   src/CompressedReader.cc
   src/CompressedWriter.cc
@@ -659,6 +660,7 @@ set(BASIC_TESTS
   brk2
   capget
   chew_cpu
+  chew_cpu_cpuid
   chmod
   chown
   clock
@@ -694,9 +696,10 @@ set(BASIC_TESTS
   exit_with_syscallbuf_signal
   fadvise
   fanotify
-  fault_in_code_page
-  fcntl_owner_ex
   fcntl_dupfd
+  fault_in_code_page
+  fcntl_misc
+  fcntl_owner_ex
   fcntl_rw_hints
   fcntl_seals
   fcntl_sig

@@ -25,6 +25,7 @@ struct CPUIDRecord;
 struct DisableCPUIDFeatures;
 class KernelMapping;
 class RecordTask;
+struct TraceUuid;
 
 /**
  * TraceStream stores all the data common to both recording and
@@ -66,8 +67,6 @@ public:
 
   int bound_to_cpu() const { return bind_to_cpu; }
   void set_bound_cpu(int bound) { bind_to_cpu = bound; }
-
-  TicksSemantics ticks_semantics() const { return ticks_semantics_; }
 
   /**
    * Return the current "global time" (event count) for this
@@ -129,8 +128,6 @@ protected:
   // CPU core# that the tracees are bound to
   int32_t bind_to_cpu;
 
-  TicksSemantics ticks_semantics_;
-
   // Arbitrary notion of trace time, ticked on the recording of
   // each event (trace frame).
   FrameTime global_time;
@@ -144,7 +141,9 @@ protected:
  * -- The trace directory is created. It is empty.
  * -- A file `incomplete` is created in the trace directory. It is empty.
  * -- rr takes an exclusive flock() lock on `incomplete`.
- * -- rr writes data to `incomplete` so it is no longer empty.
+ * -- rr writes data to `incomplete` so it is no longer empty. (At this
+ * point the data is undefined.) rr may write to the file at any
+ * time during recording.
  * -- At the end of trace recording, rr renames `incomplete` to `version`.
  * At this point the trace is complete and ready to replay.
  * -- rr releases its flock() lock on `version`.
@@ -217,13 +216,6 @@ public:
    */
   bool good() const;
 
-  /** Call close() on all the relevant trace files.
-   *  Normally this will be called by the destructor. It's helpful to
-   *  call this before a crash that won't call the destructor, to ensure
-   *  buffered data is flushed.
-   */
-  void close();
-
   /**
    * Create a trace where the tracess are bound to cpu |bind_to_cpu|. This
    * data is recorded in the trace. If |bind_to_cpu| is -1 then the tracees
@@ -232,17 +224,38 @@ public:
    * or by setting -o=<OUTPUT_TRACE_DIR>.
    */
   TraceWriter(const std::string& file_name, int bind_to_cpu,
-              bool has_cpuid_faulting,
-              const DisableCPUIDFeatures& disable_cpuid_features,
-              const string& output_trace_dir,
-              TicksSemantics ticks_semantics_,
-              const uint8_t* uuid);
+              const string& output_trace_dir, TicksSemantics ticks_semantics_);
+
+  /**
+   * Called after the calling thread is actually bound to |bind_to_cpu|.
+   */
+  void setup_cpuid_records(bool has_cpuid_faulting,
+                           const DisableCPUIDFeatures& disable_cpuid_features);
+
+  enum CloseStatus {
+    /**
+     * Trace completed normally and can be replayed.
+     */
+    CLOSE_OK,
+    /**
+     * Trace completed abnormally due to rr error.
+     */
+    CLOSE_ERROR
+  };
+  /** Call close() on all the relevant trace files.
+   *  Normally this will be called by the destructor. It's helpful to
+   *  call this before a crash that won't call the destructor, to ensure
+   *  buffered data is flushed.
+   */
+  void close(CloseStatus status, const TraceUuid* uuid);
 
   /**
    * We got far enough into recording that we should set this as the latest
    * trace.
    */
   void make_latest_trace();
+
+  TicksSemantics ticks_semantics() const { return ticks_semantics_; }
 
 private:
   bool try_hardlink_file(const std::string& file_name, std::string* new_name);
@@ -263,10 +276,13 @@ private:
    */
   std::map<std::pair<dev_t, ino_t>, std::string> files_assumed_immutable;
   std::vector<RawDataMetadata> raw_recs;
+  std::vector<CPUIDRecord> cpuid_records;
+  TicksSemantics ticks_semantics_;
   // Keep the 'incomplete' (later renamed to 'version') file open until we
   // rename it, so our flock() lock stays held on it.
   ScopedFd version_fd;
   uint32_t mmap_count;
+  bool has_cpuid_faulting_;
   bool supports_file_data_cloning_;
 };
 
@@ -376,6 +392,10 @@ public:
   bool uses_cpuid_faulting() const { return trace_uses_cpuid_faulting; }
   uint64_t xcr0() const;
 
+  TicksSemantics ticks_semantics() const { return ticks_semantics_; }
+
+  double recording_time() const { return monotonic_time_; }
+
 private:
   CompressedReader& reader(Substream s) { return *readers[s]; }
   const CompressedReader& reader(Substream s) const { return *readers[s]; }
@@ -384,7 +404,9 @@ private:
   std::unique_ptr<CompressedReader> readers[SUBSTREAM_COUNT];
   std::vector<CPUIDRecord> cpuid_records_;
   std::vector<RawDataMetadata> raw_recs;
+  TicksSemantics ticks_semantics_;
   bool trace_uses_cpuid_faulting;
+  double monotonic_time_;
 };
 
 extern std::string trace_save_dir();

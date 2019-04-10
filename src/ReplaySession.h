@@ -221,7 +221,10 @@ public:
   }
 
   struct Flags {
-    Flags() : redirect_stdio(false), share_private_mappings(false) {}
+    Flags()
+      : redirect_stdio(false)
+      , share_private_mappings(false)
+      , cpu_unbound(false) {}
     Flags(const Flags& other) = default;
     bool redirect_stdio;
     bool share_private_mappings;
@@ -283,10 +286,7 @@ public:
    */
   static bool is_ignored_signal(int sig);
 
-  bool redirect_stdio() { return flags.redirect_stdio; }
-  bool share_private_mappings() { return flags.share_private_mappings; }
-
-  void set_flags(const Flags& flags) { this->flags = flags; }
+  const Flags& flags() const { return flags_; }
 
   typedef std::set<MemoryRange, MappingComparator> MemoryRanges;
   /**
@@ -299,7 +299,7 @@ public:
 
   virtual TraceStream* trace_stream() override { return &trace_in; }
 
-  virtual int get_cpu_binding(TraceStream& trace) const override;
+  virtual int cpu_binding(TraceStream& trace) const override;
 
 private:
   ReplaySession(const std::string& dir, const Flags& flags);
@@ -348,7 +348,7 @@ private:
   Ticks ticks_at_start_of_event;
   CPUIDBugDetector cpuid_bug_detector;
   siginfo_t last_siginfo_;
-  Flags flags;
+  Flags flags_;
   bool did_fast_forward;
 
   // The clock_gettime(CLOCK_MONOTONIC) timestamp of the first trace event, used

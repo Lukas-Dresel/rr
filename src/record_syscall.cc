@@ -3063,6 +3063,8 @@ static Switchable rec_prepare_syscall_arch(RecordTask* t,
         case Arch::SETOWN_EX:
         case Arch::GETSIG:
         case Arch::SETSIG:
+        case Arch::SETPIPE_SZ:
+        case Arch::GETPIPE_SZ:
         case Arch::ADD_SEALS:
         case Arch::SET_RW_HINT:
         case Arch::SET_FILE_RW_HINT:
@@ -4640,13 +4642,18 @@ static void process_mmap(RecordTask* t, size_t length, int prot, int flags,
       TraceWriter::RECORD_IN_TRACE) {
     off64_t end = (off64_t)st.st_size - km.file_offset_bytes();
     off64_t nbytes = min(end, (off64_t)km.size());
-    if (adjusted_size) {
+    ssize_t nread = t->record_remote_fallible(addr, nbytes);
+    if (!adjusted_size && nread != nbytes) {
       // If we adjusted the size, we're not guaranteed that the bytes we're
       // reading are actually valid (it could actually have been a zero-sized
-      // file), so use the fallible variant.
-      t->record_remote_fallible(addr, nbytes);
-    } else {
-      t->record_remote(addr, nbytes);
+      // file).
+      auto st2 = t->stat_fd(fd);
+      AddressSpace::print_process_maps(t);
+      system("df -h");
+      ASSERT(t, false) << "Failed to read expected mapped data at " << km
+          << "; expected " << nbytes << " bytes, got " << nread << " bytes,"
+          << " got file size " << st.st_size << " before and " << st2.st_size
+          << " after; is filesystem full?";
     }
 
     if ((flags & MAP_SHARED)) {
