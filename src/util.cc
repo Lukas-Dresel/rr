@@ -1,8 +1,5 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define FIRST_INTERESTING_EVENT 10700
-//#define LAST_INTERESTING_EVENT 10900
-
 #include "util.h"
 
 #include <arpa/inet.h>
@@ -14,6 +11,7 @@
 #include <linux/capability.h>
 #include <linux/magic.h>
 #include <linux/prctl.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,7 +47,7 @@ using namespace std;
 
 namespace rr {
 
-template <typename Arch> static vector<uint8_t> read_auxv_arch(Task* t) {
+template <typename Arch> static remote_ptr<typename Arch::unsigned_word> env_ptr(Task* t) {
   auto stack_ptr = t->regs().sp().cast<typename Arch::unsigned_word>();
 
   auto argc = t->read_mem(stack_ptr);
@@ -59,6 +57,11 @@ template <typename Arch> static vector<uint8_t> read_auxv_arch(Task* t) {
   auto null_ptr = t->read_mem(stack_ptr);
   ASSERT(t, null_ptr == 0);
   stack_ptr++;
+  return stack_ptr;
+}
+
+template <typename Arch> static vector<uint8_t> read_auxv_arch(Task* t) {
+  auto stack_ptr = env_ptr<Arch>(t);
 
   // Should now point to envp
   while (0 != t->read_mem(stack_ptr)) {
@@ -83,6 +86,26 @@ template <typename Arch> static vector<uint8_t> read_auxv_arch(Task* t) {
 
 vector<uint8_t> read_auxv(Task* t) {
   RR_ARCH_FUNCTION(read_auxv_arch, t->arch(), t);
+}
+
+template <typename Arch> static vector<string> read_env_arch(Task* t) {
+  auto stack_ptr = env_ptr<Arch>(t);
+
+  // Should now point to envp
+  vector<string> result;
+  while (true) {
+    auto p = t->read_mem(stack_ptr);
+    stack_ptr++;
+    if (!p) {
+      break;
+    }
+    result.push_back(t->read_c_str(remote_ptr<char>(p)));
+  }
+  return result;
+}
+
+vector<string> read_env(Task* t) {
+  RR_ARCH_FUNCTION(read_env_arch, t->arch(), t);
 }
 
 // FIXME this function assumes that there's only one address space.
@@ -1247,11 +1270,6 @@ XSaveLayout xsave_layout_from_trace(const std::vector<CPUIDRecord> records) {
   return layout;
 }
 
-uint64_t rr_signal_mask() {
-  return signal_bit(PerfCounters::TIME_SLICE_SIGNAL) |
-         signal_bit(SYSCALLBUF_DESCHED_SIGNAL);
-}
-
 ScopedFd open_socket(const char* address, unsigned short* port,
                      ProbePort probe) {
   ScopedFd listen_fd(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
@@ -1430,22 +1448,42 @@ int get_num_cpus() {
 static const uint8_t rdtsc_insn[] = { 0x0f, 0x31 };
 static const uint8_t rdtscp_insn[] = { 0x0f, 0x01, 0xf9 };
 static const uint8_t cpuid_insn[] = { 0x0f, 0xa2 };
+static const uint8_t int3_insn[] = { 0xcc };
+static const uint8_t pushf_insn[] = { 0x9c };
+static const uint8_t pushf16_insn[] = { 0x66, 0x9c };
 
+// XXX this probably needs to be extended to decode ignored prefixes
 TrappedInstruction trapped_instruction_at(Task* t, remote_code_ptr ip) {
   uint8_t insn[sizeof(rdtscp_insn)];
-  ssize_t len =
+  ssize_t ret =
       t->read_bytes_fallible(ip.to_data_ptr<uint8_t>(), sizeof(insn), insn);
-  if ((size_t)len >= sizeof(rdtsc_insn) &&
+  if (ret < 0) {
+    return TrappedInstruction::NONE;
+  }
+  size_t len = ret;
+  if (len >= sizeof(rdtsc_insn) &&
       !memcmp(insn, rdtsc_insn, sizeof(rdtsc_insn))) {
     return TrappedInstruction::RDTSC;
   }
-  if ((size_t)len >= sizeof(rdtscp_insn) &&
+  if (len >= sizeof(rdtscp_insn) &&
       !memcmp(insn, rdtscp_insn, sizeof(rdtscp_insn))) {
     return TrappedInstruction::RDTSCP;
   }
-  if ((size_t)len >= sizeof(cpuid_insn) &&
+  if (len >= sizeof(cpuid_insn) &&
       !memcmp(insn, cpuid_insn, sizeof(cpuid_insn))) {
     return TrappedInstruction::CPUID;
+  }
+  if (len >= sizeof(int3_insn) &&
+      !memcmp(insn, int3_insn, sizeof(int3_insn))) {
+    return TrappedInstruction::INT3;
+  }
+  if (len >= sizeof(pushf_insn) &&
+      !memcmp(insn, pushf_insn, sizeof(pushf_insn))) {
+    return TrappedInstruction::PUSHF;
+  }
+  if (len >= sizeof(pushf16_insn) &&
+      !memcmp(insn, pushf16_insn, sizeof(pushf16_insn))) {
+    return TrappedInstruction::PUSHF16;
   }
   return TrappedInstruction::NONE;
 }
@@ -1457,6 +1495,12 @@ size_t trapped_instruction_len(TrappedInstruction insn) {
     return sizeof(rdtscp_insn);
   } else if (insn == TrappedInstruction::CPUID) {
     return sizeof(cpuid_insn);
+  } else if (insn == TrappedInstruction::INT3) {
+    return sizeof(int3_insn);
+  } else if (insn == TrappedInstruction::PUSHF) {
+    return sizeof(pushf_insn);
+  } else if (insn == TrappedInstruction::PUSHF16) {
+    return sizeof(pushf16_insn);
   } else {
     return 0;
   }
@@ -1612,6 +1656,23 @@ void write_all(int fd, const void* buf, size_t size) {
   }
 }
 
+ssize_t pwrite_all_fallible(int fd, const void* buf, size_t size, off_t offset) {
+  ssize_t written = 0;
+  while (size > 0) {
+    ssize_t ret = ::pwrite64(fd, buf, size, offset);
+    if (ret <= 0) {
+      if (written > 0) {
+        return written;
+      }
+      return ret;
+    }
+    buf = static_cast<const char*>(buf) + ret;
+    written += ret;
+    size -= ret;
+  }
+  return written;
+}
+
 bool is_directory(const char* path) {
   struct stat buf;
   if (stat(path, &buf) < 0) {
@@ -1670,6 +1731,32 @@ template <typename Arch> static size_t word_size_arch() {
 
 size_t word_size(SupportedArch arch) {
   RR_ARCH_FUNCTION(word_size_arch, arch);
+}
+
+string json_escape(const string& str, size_t pos) {
+  string out;
+  for (size_t i = pos; i < str.size(); ++i) {
+    char c = str[i];
+    if (c < 32) {
+      char buf[8];
+      sprintf(buf, "\\u%04x", c);
+      out += buf;
+    } else if (c == '\\') {
+      out += "\\\\";
+    } else if (c == '\"') {
+      out += "\\\"";
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+void sleep_time(double t) {
+  struct timespec ts;
+  ts.tv_sec = (time_t)floor(t);
+  ts.tv_nsec = (long)((t - ts.tv_sec) * 1e9);
+  nanosleep(&ts, NULL);
 }
 
 } // namespace rr

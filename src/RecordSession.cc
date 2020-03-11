@@ -107,7 +107,7 @@ static void record_robust_futex_changes(RecordTask* t) {
   RR_ARCH_FUNCTION(record_robust_futex_changes_arch, t->arch(), t);
 }
 
-static void record_exit(RecordTask* t, WaitStatus exit_status) {
+static void record_exit_trace_event(RecordTask* t, WaitStatus exit_status) {
   t->session().trace_writer().write_task_event(
       TraceTaskEvent::for_exit(t->tid, exit_status));
   if (t->thread_group()->tgid == t->tid) {
@@ -186,9 +186,15 @@ static bool handle_ptrace_exit_event(RecordTask* t) {
     exit_status = WaitStatus::for_fatal_sig(SIGKILL);
   }
 
-  record_exit(t, exit_status);
-  // Delete t. t's destructor writes the final EV_EXIT.
-  t->destroy();
+  record_exit_trace_event(t, exit_status);
+  t->detach();
+  t->record_exit_event();
+  if (t->do_ptrace_exit_stop(exit_status)) {
+    // Keep the RecordTask alive until the ptracer reaps it
+    t->waiting_for_reap = true;
+  } else {
+    delete t;
+  }
   return true;
 }
 
@@ -548,7 +554,8 @@ bool RecordSession::handle_ptrace_event(RecordTask** t_ptr,
         // Mark task as unstable so we don't wait on its futex. This matches
         // what the kernel would do.
         t->unstable = true;
-        record_exit(t, WaitStatus(0));
+        t->record_exit_event();
+        record_exit_trace_event(t, WaitStatus(0));
         // Don't call RecordTask::destroy() because we don't want to
         // PTRACE_DETACH.
         delete t;
@@ -708,7 +715,7 @@ static void advance_to_disarm_desched_syscall(RecordTask* t) {
     // we arm the desched signal before we restart a blocking syscall, which
     // completes successfully, then we disarm, then we see a desched signal
     // here.
-    if (SYSCALLBUF_DESCHED_SIGNAL == sig) {
+    if (t->session().syscallbuf_desched_sig() == sig) {
       continue;
     }
     if (sig && sig == old_sig) {
@@ -1184,7 +1191,7 @@ static bool preinject_signal(RecordTask* t) {
     // Always send SYSCALLBUF_DESCHED_SIGNAL because other signals (except
     // TIME_SLICE_SIGNAL) will be blocked by
     // RecordTask::will_resume_execution().
-    t->tgkill(SYSCALLBUF_DESCHED_SIGNAL);
+    t->tgkill(t->session().syscallbuf_desched_sig());
 
     /* Now singlestep the task until we're in a signal-stop for the signal
      * we've just sent. We must absorb and forget that signal here since we
@@ -1206,7 +1213,7 @@ static bool preinject_signal(RecordTask* t) {
       return false;
     }
 
-    ASSERT(t, t->stop_sig() == SYSCALLBUF_DESCHED_SIGNAL)
+    ASSERT(t, t->stop_sig() == t->session().syscallbuf_desched_sig())
         << "Expected SYSCALLBUF_DESCHED_SIGNAL, got " << t->status();
     /* We're now in a signal-stop */
   }
@@ -1247,14 +1254,14 @@ static bool inject_handled_signal(RecordTask* t) {
     t->invalidate_sigmask();
     // Repeat injection if we got a desched signal. We observe in Linux 4.14.12
     // that we get SYSCALLBUF_DESCHED_SIGNAL here once in a while.
-  } while (t->stop_sig() == SYSCALLBUF_DESCHED_SIGNAL);
+  } while (t->stop_sig() == t->session().syscallbuf_desched_sig());
 
   if (t->stop_sig() == SIGSEGV) {
     // Constructing the signal handler frame must have failed. The kernel will
     // kill the process after this. Stash the signal and make sure
     // we know to treat it as fatal when we inject it. Also disable the
     // signal handler to match what the kernel does.
-    t->set_sig_handler_default(SIGSEGV);
+    t->did_set_sig_handler_default(SIGSEGV);
     t->stash_sig();
     t->thread_group()->received_sigframe_SIGSEGV = true;
     return false;
@@ -1358,9 +1365,9 @@ void RecordSession::signal_state_changed(RecordTask* t, StepState* step_state) {
       }
 
       // We record this data even if sigframe_size is zero to simplify replay.
-      // Stop recording data if we run off the end of a writeable mapping.
+      // Stop recording data if we run off the end of a writable mapping.
       // Our sigframe size is conservative so we need to do this.
-      t->record_remote_writeable(t->regs().sp(), sigframe_size);
+      t->record_remote_writable(t->regs().sp(), sigframe_size);
 
       // This event is used by the replayer to set up the signal handler frame.
       // But if we don't have a handler, we don't want to record the event
@@ -1474,7 +1481,7 @@ bool RecordSession::handle_signal_event(RecordTask* t, StepState* step_state) {
   // was blocked now, before we update our cached sigmask.
   SignalBlocked signal_was_blocked =
       t->is_sig_blocked(sig) ? SIG_BLOCKED : SIG_UNBLOCKED;
-  if (deterministic || sig == SYSCALLBUF_DESCHED_SIGNAL) {
+  if (deterministic || sig == t->session().syscallbuf_desched_sig()) {
     // Don't stash these signals; deliver them immediately.
     // We don't want them to be reordered around other signals.
     // invalidate_sigmask() must not be called before we reach handle_signal!
@@ -1549,7 +1556,7 @@ bool RecordSession::handle_signal_event(RecordTask* t, StepState* step_state) {
 bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
                                           RecordResult* step_result,
                                           SupportedArch syscall_arch) {
-  if (t->has_stashed_sig_not_synthetic_SIGCHLD()) {
+  if (const siginfo_t* si = t->stashed_sig_not_synthetic_SIGCHLD()) {
     // The only four cases where we allow a stashed signal to be pending on
     // syscall entry are:
     // -- the signal is a ptrace-related signal, in which case if it's generated
@@ -1570,7 +1577,9 @@ bool RecordSession::process_syscall_entry(RecordTask* t, StepState* step_state,
                t->ip() ==
                    t->vm()
                        ->privileged_traced_syscall_ip()
-                       .increment_by_syscall_insn_length(t->arch()));
+                       .increment_by_syscall_insn_length(t->arch()))
+      << "Stashed signal pending on syscall entry when it shouldn't be: "
+      << *si << "; IP=" << t->ip();
   }
 
   // We just entered a syscall.
@@ -1682,6 +1691,15 @@ bool RecordSession::prepare_to_inject_signal(RecordTask* t,
     }
   }
 
+  if (sig->deterministic == DETERMINISTIC_SIG &&
+      sig->siginfo.si_signo == SIGSYS &&
+      t->is_sig_blocked(sig->siginfo.si_signo) == SIG_BLOCKED) {
+    // Our synthesized deterministic SIGSYS (seccomp trap) needs to match the
+    // kernel behavior of unblocking the signal and resetting disposition to
+    // default.
+    t->unblock_signal(SIGSYS);
+    t->set_sig_handler_default(SIGSYS);
+  }
   switch (handle_signal(t, &si.linux_api, sig->deterministic, SIG_UNBLOCKED)) {
     case SIGNAL_PTRACE_STOP:
       // Emulated ptrace-stop. Don't run the task again yet.
@@ -1717,20 +1735,51 @@ bool RecordSession::prepare_to_inject_signal(RecordTask* t,
   return true;
 }
 
-static string find_syscall_buffer_library() {
+static string find_helper_library(const char* basepath) {
   string lib_path = resource_path() + "lib64/rr/";
-  string file_name = lib_path + SYSCALLBUF_LIB_FILENAME;
+  string file_name = lib_path + basepath;
   if (access(file_name.c_str(), F_OK) == 0) {
     return lib_path;
   }
   lib_path = resource_path() + "lib/rr/";
-  file_name = lib_path + SYSCALLBUF_LIB_FILENAME;
+  file_name = lib_path + basepath;
   if (access(file_name.c_str(), F_OK) == 0) {
     return lib_path;
   }
   // File does not exist. Assume install put it in LD_LIBRARY_PATH.
   lib_path = "";
   return lib_path;
+}
+
+static void inject_ld_helper_library(vector<string>& env,
+                                     string env_var,
+                                     string value) {
+  // Our preload lib should come first if possible, because that will speed up
+  // the loading of the other libraries; it's also a good idea to put our audit
+  // library at the head of the list, since there's only sixteen possible link
+  // namespaces on glibc and each audit library uses up one.
+  //
+  // We supply a placeholder which is then mutated to the correct filename in
+  // Monkeypatcher::patch_after_exec.
+  auto env_assignment = env_var + "=";
+  auto it = env.begin();
+  for (; it != env.end(); ++it) {
+    if (it->find(env_assignment) != 0) {
+      continue;
+    }
+    // Honor old preloads too.  This may cause
+    // problems, but only in those libs, and
+    // that's the user's problem.
+    value += ":";
+    value += it->substr(it->find("=") + 1);
+    break;
+  }
+  value = env_assignment + value;
+  if (it == env.end()) {
+    env.push_back(value);
+  } else {
+    *it = value;
+  }
 }
 
 struct ExeInfo {
@@ -1802,9 +1851,12 @@ static string lookup_by_path(const string& name) {
 /*static*/ RecordSession::shr_ptr RecordSession::create(
     const vector<string>& argv, const vector<string>& extra_env,
     const DisableCPUIDFeatures& disable_cpuid_features,
-    SyscallBuffering syscallbuf, BindCPU bind_cpu,
+    SyscallBuffering syscallbuf,
+    unsigned char syscallbuf_desched_sig,
+    BindCPU bind_cpu,
     const string& output_trace_dir,
-    const TraceUuid* trace_id) {
+    const TraceUuid* trace_id,
+    bool use_audit) {
   // The syscallbuf library interposes some critical
   // external symbols like XShmQueryExtension(), so we
   // preload it whether or not syscallbuf is enabled. Indicate here whether
@@ -1822,11 +1874,12 @@ static string lookup_by_path(const string& name) {
         buf[size] = 0;
         int val = atoi(buf);
         if (val > 1) {
-          FATAL() << "rr needs /proc/sys/kernel/perf_event_paranoid <= 1, but "
-                     "it is "
-                  << val << ".\nChange it to 1, or use 'rr record -n' (slow).\n"
-                  << "Consider putting 'kernel.perf_event_paranoid = 1' in "
-                     "/etc/sysctl.conf";
+          fprintf(stderr,
+                  "rr needs /proc/sys/kernel/perf_event_paranoid <= 1, but it is %d.\n"
+                  "Change it to 1, or use 'rr record -n' (slow).\n"
+                  "Consider putting 'kernel.perf_event_paranoid = 1' in /etc/sysctl.conf\n",
+                  val);
+          exit(1);
         }
       }
     }
@@ -1839,36 +1892,24 @@ static string lookup_by_path(const string& name) {
   ExeInfo exe_info = read_exe_info(full_path);
 
   // LD_PRELOAD the syscall interception lib
-  string syscall_buffer_lib_path = find_syscall_buffer_library();
+  string syscall_buffer_lib_path = find_helper_library(SYSCALLBUF_LIB_FILENAME);
   if (!syscall_buffer_lib_path.empty()) {
-    string ld_preload = "LD_PRELOAD=";
+    string ld_preload = "";
     if (!exe_info.libasan_path.empty()) {
       LOG(debug) << "Prepending " << exe_info.libasan_path << " to LD_PRELOAD";
       // Put an LD_PRELOAD entry for it before our preload library, because
       // it checks that it's loaded first
       ld_preload += exe_info.libasan_path + ":";
     }
-    // Our preload lib should come first if possible, because that will
-    // speed up the loading of the other libraries. We supply a placeholder
-    // which is then mutated to the correct filename in
-    // Monkeypatcher::patch_after_exec.
     ld_preload += syscall_buffer_lib_path + SYSCALLBUF_LIB_FILENAME_PADDED;
-    auto it = env.begin();
-    for (; it != env.end(); ++it) {
-      if (it->find("LD_PRELOAD=") != 0) {
-        continue;
-      }
-      // Honor old preloads too.  This may cause
-      // problems, but only in those libs, and
-      // that's the user's problem.
-      ld_preload += ":";
-      ld_preload += it->substr(it->find("=") + 1);
-      break;
-    }
-    if (it == env.end()) {
-      env.push_back(ld_preload);
-    } else {
-      *it = ld_preload;
+    inject_ld_helper_library(env, "LD_PRELOAD", ld_preload);
+  }
+
+  if (use_audit) {
+    string rtld_audit_lib_path = find_helper_library(RTLDAUDIT_LIB_FILENAME);
+    if (!rtld_audit_lib_path.empty()) {
+      string ld_audit = rtld_audit_lib_path + RTLDAUDIT_LIB_FILENAME_PADDED;
+      inject_ld_helper_library(env, "LD_AUDIT", ld_audit);
     }
   }
 
@@ -1895,7 +1936,8 @@ static string lookup_by_path(const string& name) {
 
   shr_ptr session(
       new RecordSession(full_path, argv, env, disable_cpuid_features,
-                        syscallbuf, bind_cpu, output_trace_dir, trace_id));
+                        syscallbuf, syscallbuf_desched_sig, bind_cpu,
+                        output_trace_dir, trace_id, use_audit));
   session->set_asan_active(!exe_info.libasan_path.empty() ||
                            exe_info.has_asan_symbols);
   return session;
@@ -1905,9 +1947,12 @@ RecordSession::RecordSession(const std::string& exe_path,
                              const std::vector<std::string>& argv,
                              const std::vector<std::string>& envp,
                              const DisableCPUIDFeatures& disable_cpuid_features,
-                             SyscallBuffering syscallbuf, BindCPU bind_cpu,
+                             SyscallBuffering syscallbuf,
+                             int syscallbuf_desched_sig,
+                             BindCPU bind_cpu,
                              const string& output_trace_dir,
-                             const TraceUuid* trace_id)
+                             const TraceUuid* trace_id,
+                             bool use_audit)
     : trace_out(argv[0], choose_cpu(bind_cpu), output_trace_dir, ticks_semantics_),
       scheduler_(*this),
       trace_id(trace_id),
@@ -1916,12 +1961,14 @@ RecordSession::RecordSession(const std::string& exe_path,
       continue_through_sig(0),
       last_task_switchable(PREVENT_SWITCH),
       syscall_buffer_size_(1024 * 1024),
+      syscallbuf_desched_sig_(syscallbuf_desched_sig),
       use_syscall_buffer_(syscallbuf == ENABLE_SYSCALL_BUF),
       use_file_cloning_(true),
       use_read_cloning_(true),
       enable_chaos_(false),
       asan_active_(false),
-      wait_for_all_(false) {
+      wait_for_all_(false),
+      use_audit_(use_audit) {
   if (!has_cpuid_faulting() &&
       disable_cpuid_features.any_features_disabled()) {
     FATAL() << "CPUID faulting required to disable CPUID features";
@@ -1990,7 +2037,8 @@ RecordSession::RecordResult RecordSession::record_step() {
     t->log_pending_events();
   }
   if (handle_ptrace_exit_event(t)) {
-    // t is dead and has been deleted.
+    // t may have been deleted.
+    last_task_switchable = ALLOW_SWITCH;
     return result;
   }
 
@@ -2103,6 +2151,11 @@ RecordTask* RecordSession::find_task(pid_t rec_tid) const {
 
 RecordTask* RecordSession::find_task(const TaskUid& tuid) const {
   return static_cast<RecordTask*>(Session::find_task(tuid));
+}
+
+uint64_t RecordSession::rr_signal_mask() const {
+  return signal_bit(PerfCounters::TIME_SLICE_SIGNAL) |
+         signal_bit(syscallbuf_desched_sig_);
 }
 
 static const uint32_t CPUID_RDRAND_FLAG = 1 << 30;

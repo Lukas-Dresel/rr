@@ -1196,6 +1196,27 @@ sched_setaffinity = IrregularEmulatedSyscall(x86=241, x64=203)
 # is zero, then the mask of the calling process is returned.
 sched_getaffinity = IrregularEmulatedSyscall(x86=242, x64=204)
 
+# int sched_setattr(pid_t pid, struct sched_attr *attr,
+#                   unsigned int flags);
+#
+# The sched_setattr() system call sets the scheduling policy and
+# associated attributes for the thread whose ID is specified in pid.
+# If pid equals zero, the scheduling policy and attributes of the
+# calling thread will be set.
+#
+# XXX Do we want to restrict somehow how this plays with rr's
+# scheduling?
+sched_setattr = EmulatedSyscall(x86=351, x64=314)
+
+# int sched_getattr(pid_t pid, struct sched_attr *attr,
+#                   unsigned int size, unsigned int flags);
+#
+# The sched_getattr() system call fetches the scheduling policy and the
+# associated attributes for the thread whose ID is specified in pid.
+# If pid equals zero, the scheduling policy and attributes of the call‐
+# ing thread will be retrieved.
+sched_getattr = IrregularEmulatedSyscall(x86=352, x64=315)
+
 #  int set_thread_area(struct user_desc *u_info)
 #
 # set_thread_area() sets an entry in the current thread's Thread Local
@@ -1633,15 +1654,13 @@ process_vm_readv = IrregularEmulatedSyscall(x86=347, x64=310)
 process_vm_writev = IrregularEmulatedSyscall(x86=348, x64=311)
 kcmp = EmulatedSyscall(x86=349, x64=312)
 finit_module = UnsupportedSyscall(x86=350, x64=313)
-sched_setattr = UnsupportedSyscall(x86=351, x64=314)
-sched_getattr = UnsupportedSyscall(x86=352, x64=315)
 renameat2 = EmulatedSyscall(x86=353, x64=316)
 seccomp = IrregularEmulatedSyscall(x86=354, x64=317)
 getrandom = IrregularEmulatedSyscall(x86=355, x64=318)
 memfd_create = IrregularEmulatedSyscall(x86=356, x64=319)
 arch_prctl = IrregularEmulatedSyscall(x86=384, x64=158)
 
-bpf = UnsupportedSyscall(x86=357, x64=321)
+bpf = IrregularEmulatedSyscall(x86=357, x64=321)
 execveat = UnsupportedSyscall(x86=358, x64=322)
 userfaultfd = UnsupportedSyscall(x86=374, x64=323)
 membarrier = EmulatedSyscall(x86=375, x64=324)
@@ -1656,6 +1675,39 @@ statx = EmulatedSyscall(x86=383, x64=332, arg5="typename Arch::statx_struct")
 io_pgetevents = UnsupportedSyscall(x86=385, x64=333)
 rseq = UnsupportedSyscall(x86=386, x64=334)
 
+clock_gettime64 = UnsupportedSyscall(x86=403)
+clock_settime64 = UnsupportedSyscall(x86=404)
+clock_adjtime64 = UnsupportedSyscall(x86=405)
+clock_getres_time64 = UnsupportedSyscall(x86=406)
+clock_nanosleep_time64 = UnsupportedSyscall(x86=407)
+timer_gettime64 = UnsupportedSyscall(x86=408)
+timer_settime64 = UnsupportedSyscall(x86=409)
+timerfd_gettime64 = UnsupportedSyscall(x86=410)
+timerfd_settime64 = UnsupportedSyscall(x86=411)
+utimensat_time64 = UnsupportedSyscall(x86=412)
+pselect6_time64 = UnsupportedSyscall(x86=413)
+ppoll_time64 = UnsupportedSyscall(x86=414)
+io_pgetevents_time64 = UnsupportedSyscall(x86=416)
+recvmmsg_time64 = UnsupportedSyscall(x86=417)
+mq_timedsend_time64 = UnsupportedSyscall(x86=418)
+mq_timedreceive_time64 = UnsupportedSyscall(x86=419)
+semtimedop_time64 = UnsupportedSyscall(x86=420)
+rt_sigtimedwait_time64 = UnsupportedSyscall(x86=421)
+futex_time64 = UnsupportedSyscall(x86=422)
+sched_rr_get_interval_time64 = UnsupportedSyscall(x86=423)
+
+# x86-64 decided to skip ahead here to catchup
+pidfd_send_signal = UnsupportedSyscall(x86=424, x64=424)
+io_uring_setup = UnsupportedSyscall(x86=425, x64=425)
+io_uring_enter = UnsupportedSyscall(x86=426, x64=426)
+io_uring_register = UnsupportedSyscall(x86=427, x64=427)
+open_tree = UnsupportedSyscall(x86=428, x64=428)
+move_mount = UnsupportedSyscall(x86=429, x64=429)
+fsopen = UnsupportedSyscall(x86=430, x64=430)
+fsconfig = UnsupportedSyscall(x86=431, x64=431)
+fsmount = UnsupportedSyscall(x86=432, x64=432)
+fspick = UnsupportedSyscall(x86=433, x64=433)
+
 # restart_syscall is a little special.
 restart_syscall = RestartSyscall(x86=0, x64=219)
 
@@ -1665,6 +1717,8 @@ rrcall_notify_syscall_hook_exit = IrregularEmulatedSyscall(x86=444, x64=444)
 rrcall_notify_control_msg = IrregularEmulatedSyscall(x86=445, x64=445)
 rrcall_reload_auxv = IrregularEmulatedSyscall(x86=446, x64=446)
 rrcall_mprotect_record = IrregularEmulatedSyscall(x86=447, x64=447)
+rrcall_notify_stap_semaphore_added = IrregularEmulatedSyscall(x86=448, x64=448)
+rrcall_notify_stap_semaphore_removed = IrregularEmulatedSyscall(x86=449, x64=449)
 
 # These syscalls are also subsumed under socketcall on x86.
 socket = EmulatedSyscall(x86=359, x64=41)

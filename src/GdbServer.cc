@@ -53,7 +53,8 @@ static const string& gdb_rr_macros() {
 
   if (s.empty()) {
     stringstream ss;
-    ss << "define restart\n"
+    ss << GdbCommandHandler::gdb_macros()
+       << "define restart\n"
        << "  run c$arg0\n"
        << "end\n"
        << "document restart\n"
@@ -71,47 +72,44 @@ static const string& gdb_rr_macros() {
        // issue the "stepi" command, then gdb refuses to restart
        // execution.
        << "define hook-run\n"
-       << "  if $_thread != 0 && !$suppress_run_hook\n"
-       << "    stepi\n"
-       << "  end\n"
+       << "  rr-hook-run\n"
        << "end\n"
        << "define hookpost-continue\n"
-       << "  set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-step\n"
-       << "  set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-stepi\n"
-       << "  set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-next\n"
-       << "  set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-nexti\n"
-       << "  set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-finish\n"
-       << "  set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-reverse-continue\n"
-       << "  set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-reverse-step\n"
-       << "  set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-reverse-stepi\n"
-       << "  set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-reverse-finish\n"
-       << "  set $suppress_run_hook = 1\n"
+       << "  rr-set-suppress-run-hook 1\n"
        << "end\n"
        << "define hookpost-run\n"
-       << "  set $suppress_run_hook = 0\n"
+       << "  rr-set-suppress-run-hook 0\n"
        << "end\n"
        << "set unwindonsignal on\n"
        << "handle SIGURG stop\n"
        << "set prompt (rr) \n"
-       << GdbCommandHandler::gdb_macros()
        // Try both "set target-async" and "maint set target-async" since
        // that changed recently.
        << "python\n"
@@ -503,6 +501,14 @@ void GdbServer::dispatch_debugger_request(Session& session,
       // odd times
       // (e.g. before sending the magic write to create a checkpoint)
       if (req.mem().len == 0) {
+        dbg->reply_set_mem(true);
+        return;
+      }
+      // If an address is recognised as belonging to a SystemTap semaphore it's
+      // because it was detected by the audit library during recording and
+      // pre-incremented.
+      if (target->vm()->is_stap_semaphore(req.mem().addr)) {
+        LOG(info) << "Suppressing write to SystemTap semaphore";
         dbg->reply_set_mem(true);
         return;
       }

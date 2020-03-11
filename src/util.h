@@ -3,7 +3,8 @@
 #ifndef RR_UTIL_H_
 #define RR_UTIL_H_
 
-#include "signal.h"
+#include <signal.h>
+#include <stdio.h>
 
 #include <array>
 #include <map>
@@ -14,6 +15,12 @@
 #include "ScopedFd.h"
 #include "TraceFrame.h"
 #include "remote_ptr.h"
+
+/* This is pretty arbitrary. On Linux SIGPWR is sent to PID 1 (init) on
+ * power failure, and it's unlikely rr will be recording that.
+ * Note that SIGUNUSED means SIGSYS which actually *is* used (by seccomp),
+ * so we can't use it. */
+#define SYSCALLBUF_DEFAULT_DESCHED_SIGNAL SIGPWR
 
 namespace rr {
 
@@ -36,6 +43,11 @@ enum Completion { COMPLETE, INCOMPLETE };
  * Returns a vector containing the raw data you can get from getauxval.
  */
 std::vector<uint8_t> read_auxv(Task* t);
+
+/**
+ * Returns a vector containing the environment strings.
+ */
+std::vector<std::string> read_env(Task* t);
 
 /**
  * Create a file named |filename| and dump |buf_len| words in |buf| to
@@ -319,8 +331,6 @@ inline size_t xsave_area_size() { return xsave_native_layout().full_size; }
 
 inline sig_set_t signal_bit(int sig) { return sig_set_t(1) << (sig - 1); }
 
-uint64_t rr_signal_mask();
-
 inline bool is_kernel_trap(int si_code) {
   /* XXX unable to find docs on which of these "should" be
    * right.  The SI_KERNEL code is seen in the int3 test, so we
@@ -384,9 +394,12 @@ enum class TrappedInstruction {
   RDTSC = 1,
   RDTSCP = 2,
   CPUID = 3,
+  INT3 = 4,
+  PUSHF = 5,
+  PUSHF16 = 6,
 };
 
-/* If |t->ip()| points at a disabled instruction, return the instruction */
+/* If |t->ip()| points at a decoded instruction, return the instruction */
 TrappedInstruction trapped_instruction_at(Task* t, remote_code_ptr ip);
 
 /* Return the length of the TrappedInstruction */
@@ -410,6 +423,9 @@ uint32_t crc32(uint32_t crc, unsigned char* buf, size_t len);
 /* Like write(2) but any error or "device full" is treated as fatal. We also
  * ensure that all bytes are written by looping on short writes. */
 void write_all(int fd, const void* buf, size_t size);
+
+/* Like pwrite64(2) but we try to write all bytes by looping on short writes. */
+ssize_t pwrite_all_fallible(int fd, const void* buf, size_t size, off_t offset);
 
 /* Returns true if |path| is an accessible directory. Returns false if there
  * was an error.
@@ -436,6 +452,13 @@ void restore_initial_resource_limits();
  * Return the word size for the architecture.
  */
 size_t word_size(SupportedArch arch);
+
+/**
+ * Print JSON-escaped version of the string, including double-quotes.
+ */
+std::string json_escape(const std::string& str, size_t pos = 0);
+
+void sleep_time(double t);
 
 } // namespace rr
 

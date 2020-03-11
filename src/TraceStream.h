@@ -133,6 +133,11 @@ protected:
   FrameTime global_time;
 };
 
+struct TraceRemoteFd {
+  pid_t tid;
+  int fd;
+};
+
 /**
  * Trace writing takes the trace directory through a defined set of states.
  * These states can be usefully observed by external programs.
@@ -193,10 +198,13 @@ public:
    */
   RecordInTrace write_mapped_region(RecordTask* t, const KernelMapping& map,
                                     const struct stat& stat,
-                                    MappingOrigin origin = SYSCALL_MAPPING);
+                                    const std::vector<TraceRemoteFd>& extra_fds,
+                                    MappingOrigin origin = SYSCALL_MAPPING,
+                                    bool skip_monitoring_mapped_fd = false);
 
   static void write_mapped_region_to_alternative_stream(
-      CompressedWriter& mmaps, const MappedData& data, const KernelMapping& km);
+      CompressedWriter& mmaps, const MappedData& data, const KernelMapping& km,
+      const std::vector<TraceRemoteFd>& extra_fds, bool skip_monitoring_mapped_fd);
 
   /**
    * Write a raw-data record to the trace.
@@ -318,7 +326,9 @@ public:
   KernelMapping read_mapped_region(
       MappedData* data = nullptr, bool* found = nullptr,
       ValidateSourceFile validate = VALIDATE,
-      TimeConstraint time_constraint = CURRENT_TIME_ONLY);
+      TimeConstraint time_constraint = CURRENT_TIME_ONLY,
+      std::vector<TraceRemoteFd>* extra_fds = nullptr,
+      bool* skip_monitoring_mapped_fd = nullptr);
 
   /**
    * Read a task event (clone or exec record) from the trace.
@@ -391,6 +401,11 @@ public:
   }
   bool uses_cpuid_faulting() const { return trace_uses_cpuid_faulting; }
   uint64_t xcr0() const;
+  // Prior to issue 2370, we did not emit mapping into the trace for the
+  // preload_thread_locals mapping if it was created by a clone(2) without
+  // CLONE_VM. This is true if that has been fixed.
+  bool preload_thread_locals_recorded() const { return preload_thread_locals_recorded_; }
+  const TraceUuid& uuid() const { return *uuid_; }
 
   TicksSemantics ticks_semantics() const { return ticks_semantics_; }
 
@@ -405,8 +420,10 @@ private:
   std::vector<CPUIDRecord> cpuid_records_;
   std::vector<RawDataMetadata> raw_recs;
   TicksSemantics ticks_semantics_;
-  bool trace_uses_cpuid_faulting;
   double monotonic_time_;
+  std::unique_ptr<TraceUuid> uuid_;
+  bool trace_uses_cpuid_faulting;
+  bool preload_thread_locals_recorded_;
 };
 
 extern std::string trace_save_dir();

@@ -47,10 +47,11 @@ static void write_and_record_mem(RecordTask* t, remote_ptr<T> child_addr,
 
 /**
  * RecordSession sets up an LD_PRELOAD environment variable with an entry
- * SYSCALLBUF_LIB_FILENAME_PADDED which is big enough to hold either the
- * 32-bit or 64-bit preload library file names. Immediately after exec we
- * enter this function, which patches the environment variable value with
- * the correct library name for the task's architecture.
+ * SYSCALLBUF_LIB_FILENAME_PADDED (and, if enabled, an LD_AUDIT environment
+ * variable with an entry RTLDAUDIT_LIB_FILENAME_PADDED) which is big enough to
+ * hold either the 32-bit or 64-bit preload/audit library file names.
+ * Immediately after exec we enter this function, which patches the environment
+ * variable value with the correct library name for the task's architecture.
  *
  * It's possible for this to fail if a tracee alters the LD_PRELOAD value
  * and then does an exec. That's just too bad. If we ever have to handle that,
@@ -59,15 +60,20 @@ static void write_and_record_mem(RecordTask* t, remote_ptr<T> child_addr,
  * overridden by the preload library, or might override them itself (e.g.
  * because we're recording an rr replay).
  */
-template <typename Arch> static void setup_preload_library_path(RecordTask* t) {
-  static_assert(sizeof(SYSCALLBUF_LIB_FILENAME_PADDED) ==
-                    sizeof(SYSCALLBUF_LIB_FILENAME_32),
-                "filename length mismatch");
+#define setup_library_path(arch, env_var, soname, task) \
+  setup_library_path_arch<arch>(task, env_var, soname ## _BASE, \
+                                soname ## _PADDED, soname ## _32)
 
+template <typename Arch>
+static void setup_library_path_arch(RecordTask* t, const char* env_var,
+                                    const char* soname_base,
+                                    const char* soname_padded,
+                                    const char* soname_32) {
   const char* lib_name =
       sizeof(typename Arch::unsigned_word) < sizeof(uintptr_t)
-          ? SYSCALLBUF_LIB_FILENAME_32
-          : SYSCALLBUF_LIB_FILENAME_PADDED;
+          ? soname_32
+          : soname_padded;
+  auto env_assignment = string(env_var) + "=";
 
   auto p = t->regs().sp().cast<typename Arch::unsigned_word>();
   auto argc = t->read_mem(p);
@@ -75,17 +81,17 @@ template <typename Arch> static void setup_preload_library_path(RecordTask* t) {
   while (true) {
     auto envp = t->read_mem(p);
     if (!envp) {
-      LOG(debug) << "LD_PRELOAD not found";
+      LOG(debug) << env_var << " not found";
       return;
     }
     string env = t->read_c_str(envp);
-    if (env.find("LD_PRELOAD=") != 0) {
+    if (env.find(env_assignment) != 0) {
       ++p;
       continue;
     }
-    size_t lib_pos = env.find(SYSCALLBUF_LIB_FILENAME_BASE);
+    size_t lib_pos = env.find(soname_base);
     if (lib_pos == string::npos) {
-      LOG(debug) << SYSCALLBUF_LIB_FILENAME_BASE " not found in LD_PRELOAD";
+      LOG(debug) << soname_base << " not found in " << env_var;
       return;
     }
     size_t next_colon = env.find(':', lib_pos);
@@ -95,21 +101,36 @@ template <typename Arch> static void setup_preload_library_path(RecordTask* t) {
         ++next_colon;
       }
       if (next_colon + 1 <
-          lib_pos + sizeof(SYSCALLBUF_LIB_FILENAME_PADDED) - 1) {
+          lib_pos + sizeof(soname_padded) - 1) {
         LOG(debug) << "Insufficient space for " << lib_name
-                   << " in LD_PRELOAD before next ':'";
+                   << " in " << env_var << " before next ':'";
         return;
       }
     }
-    if (env.length() < lib_pos + sizeof(SYSCALLBUF_LIB_FILENAME_PADDED) - 1) {
+    if (env.length() < lib_pos + sizeof(soname_padded) - 1) {
       LOG(debug) << "Insufficient space for " << lib_name
-                 << " in LD_PRELOAD before end of string";
+                 << " in " << env_var << " before end of string";
       return;
     }
     remote_ptr<void> dest = envp + lib_pos;
-    write_and_record_mem(t, dest.cast<char>(), lib_name,
-                         sizeof(SYSCALLBUF_LIB_FILENAME_PADDED) - 1);
+    write_and_record_mem(t, dest.cast<char>(), lib_name, strlen(soname_padded));
     return;
+  }
+}
+
+template <typename Arch> static void setup_preload_library_path(RecordTask* t) {
+  static_assert(sizeof(SYSCALLBUF_LIB_FILENAME_PADDED) ==
+                    sizeof(SYSCALLBUF_LIB_FILENAME_32),
+                "filename length mismatch");
+  setup_library_path(Arch, "LD_PRELOAD", SYSCALLBUF_LIB_FILENAME, t);
+}
+
+template <typename Arch> static void setup_audit_library_path(RecordTask* t) {
+  static_assert(sizeof(RTLDAUDIT_LIB_FILENAME_PADDED) ==
+                    sizeof(RTLDAUDIT_LIB_FILENAME_32),
+                "filename length mismatch");
+  if (t->session().use_audit()) {
+    setup_library_path(Arch, "LD_AUDIT", RTLDAUDIT_LIB_FILENAME, t);
   }
 }
 
@@ -204,6 +225,7 @@ static remote_ptr<uint8_t> allocate_extended_jump(
                    &recorded);
       t->vm()->mapping_flags_of(addr) |= AddressSpace::Mapping::IS_PATCH_STUBS;
       t->trace_writer().write_mapped_region(t, recorded, recorded.fake_stat(),
+                                            vector<TraceRemoteFd>(),
                                             TraceWriter::PATCH_MAPPING);
     }
 
@@ -288,11 +310,12 @@ static bool patch_syscall_with_hook_x86ish(Monkeypatcher& patcher,
   static const uint8_t NOP = 0x90;
   DEBUG_ASSERT(syscall_instruction_length(x86_64) ==
                syscall_instruction_length(x86));
-  uint8_t nops[syscall_instruction_length(x86_64) +
-               hook.next_instruction_length - sizeof(jump_patch)];
-  memset(nops, NOP, sizeof(nops));
-  write_and_record_mem(t, jump_patch_start + sizeof(jump_patch), nops,
-                       sizeof(nops));
+  size_t nops_bufsize = syscall_instruction_length(x86_64) +
+                        hook.next_instruction_length - sizeof(jump_patch);
+  std::unique_ptr<uint8_t[]> nops(new uint8_t[nops_bufsize]);
+  memset(nops.get(), NOP, nops_bufsize);
+  write_and_record_mem(t, jump_patch_start + sizeof(jump_patch), nops.get(),
+                       nops_bufsize);
 
   return true;
 }
@@ -486,13 +509,14 @@ bool Monkeypatcher::try_patch_syscall(RecordTask* t) {
 
 class VdsoReader : public ElfReader {
 public:
-  VdsoReader(RecordTask* t) : ElfReader(t->arch()), t(t) {}
-  virtual bool read(size_t offset, size_t size, void* buf) override {
-    bool ok = true;
-    t->read_bytes_helper(t->vm()->vdso().start() + offset, size, buf, &ok);
-    return ok;
+  VdsoReader(RecordTask* t) : ElfReader(t->arch()) {
+    size = t->vm()->vdso().size();
+    map = new uint8_t[size];
+    t->read_bytes_helper(t->vm()->vdso().start(), size, map);
   }
-  RecordTask* t;
+  virtual ~VdsoReader() {
+    delete[] map;
+  }
 };
 
 /**
@@ -573,22 +597,22 @@ struct named_syscall {
   int syscall_number;
 };
 
-static void erase_section(VdsoReader& reader, const char* name) {
+static void erase_section(RecordTask* t, VdsoReader& reader, const char* name) {
   SectionOffsets offsets = reader.find_section_file_offsets(name);
   if (offsets.end > offsets.start) {
     vector<uint8_t> zeroes;
     zeroes.resize(offsets.end - offsets.start);
     memset(zeroes.data(), 0, zeroes.size());
-    write_and_record_bytes(reader.t,
-        reader.t->vm()->vdso().start() + offsets.start,
+    write_and_record_bytes(t,
+        t->vm()->vdso().start() + offsets.start,
         offsets.end - offsets.start, zeroes.data());
   }
 }
 
-static void obliterate_debug_info(VdsoReader& reader) {
-  erase_section(reader, ".eh_frame");
-  erase_section(reader, ".eh_frame_hdr");
-  erase_section(reader, ".note");
+static void obliterate_debug_info(RecordTask* t, VdsoReader& reader) {
+  erase_section(t, reader, ".eh_frame");
+  erase_section(t, reader, ".eh_frame_hdr");
+  erase_section(t, reader, ".note");
 }
 
 // Monkeypatch x86-32 vdso syscalls immediately after exec. The vdso syscalls
@@ -599,6 +623,7 @@ static void obliterate_debug_info(VdsoReader& reader) {
 template <>
 void patch_after_exec_arch<X86Arch>(RecordTask* t, Monkeypatcher& patcher) {
   setup_preload_library_path<X86Arch>(t);
+  setup_audit_library_path<X86Arch>(t);
 
   VdsoReader reader(t);
   auto syms = reader.read_symbols(".dynsym", ".dynstr");
@@ -627,7 +652,7 @@ void patch_after_exec_arch<X86Arch>(RecordTask* t, Monkeypatcher& patcher) {
 
   static const named_syscall syscalls_to_monkeypatch[] = {
 #define S(n) { "__vdso_" #n, X86Arch::n }
-    S(clock_gettime), S(gettimeofday), S(time),
+    S(clock_gettime), S(gettimeofday), S(time), S(clock_getres), S(clock_gettime64)
 #undef S
   };
 
@@ -662,7 +687,7 @@ void patch_after_exec_arch<X86Arch>(RecordTask* t, Monkeypatcher& patcher) {
       }
     }
   }
-  obliterate_debug_info(reader);
+  obliterate_debug_info(t, reader);
 }
 
 // Monkeypatch x86 vsyscall hook only after the preload library
@@ -720,6 +745,7 @@ void patch_at_preload_init_arch<X86Arch>(RecordTask* t,
 template <>
 void patch_after_exec_arch<X64Arch>(RecordTask* t, Monkeypatcher& patcher) {
   setup_preload_library_path<X64Arch>(t);
+  setup_audit_library_path<X64Arch>(t);
 
   auto vdso_start = t->vm()->vdso().start();
   size_t vdso_size = t->vm()->vdso().size();
@@ -729,7 +755,7 @@ void patch_after_exec_arch<X64Arch>(RecordTask* t, Monkeypatcher& patcher) {
 
   static const named_syscall syscalls_to_monkeypatch[] = {
 #define S(n) { "__vdso_" #n, X64Arch::n }
-    S(clock_gettime), S(gettimeofday), S(time), S(getcpu),
+    S(clock_gettime), S(clock_getres), S(gettimeofday), S(time), S(getcpu),
 #undef S
   };
 
@@ -783,7 +809,7 @@ void patch_after_exec_arch<X64Arch>(RecordTask* t, Monkeypatcher& patcher) {
     }
   }
 
-  obliterate_debug_info(reader);
+  obliterate_debug_info(t, reader);
 
   for (const auto& m : t->vm()->maps()) {
     auto& km = m.map;

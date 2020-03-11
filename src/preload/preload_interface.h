@@ -18,7 +18,7 @@
  */
 #define SYSCALLBUF_PROTOCOL_VERSION 0
 
-#ifdef RR_IMPLEMENT_PRELOAD
+#if defined(RR_IMPLEMENT_PRELOAD) || defined(RR_IMPLEMENT_AUDIT)
 /* Avoid using <string.h> library functions */
 static inline int streq(const char* s1, const char* s2) {
   while (1) {
@@ -95,11 +95,10 @@ static inline const char* extract_file_name(const char* s) {
 #define SYSCALLBUF_LIB_FILENAME_PADDED SYSCALLBUF_LIB_FILENAME_BASE ".so:::"
 #define SYSCALLBUF_LIB_FILENAME_32 SYSCALLBUF_LIB_FILENAME_BASE "_32.so"
 
-/* This is pretty arbitrary. On Linux SIGPWR is sent to PID 1 (init) on
- * power failure, and it's unlikely rr will be recording that.
- * Note that SIGUNUSED means SIGSYS which actually *is* used (by seccomp),
- * so we can't use it. */
-#define SYSCALLBUF_DESCHED_SIGNAL SIGPWR
+#define RTLDAUDIT_LIB_FILENAME_BASE "librraudit"
+#define RTLDAUDIT_LIB_FILENAME RTLDAUDIT_LIB_FILENAME_BASE ".so"
+#define RTLDAUDIT_LIB_FILENAME_PADDED RTLDAUDIT_LIB_FILENAME_BASE ".so:::"
+#define RTLDAUDIT_LIB_FILENAME_32 RTLDAUDIT_LIB_FILENAME_BASE "_32.so"
 
 /* Set this env var to enable syscall buffering. */
 #define SYSCALLBUF_ENABLED_ENV_VAR "_RR_USE_SYSCALLBUF"
@@ -177,11 +176,32 @@ static inline const char* extract_file_name(const char* s) {
  * fourth parameter is the prot.
  */
 #define SYS_rrcall_mprotect_record 447
+/**
+ * The audit library calls SYS_rrcall_notify_stap_semaphore_added once a batch
+ * of SystemTap semaphores have been incremented. The first parameter is the
+ * beginning of an address interval containing semaphores (inclusive) and the
+ * second parameter is the end of the address interval (exclusive).
+ *
+ * In practice a particular probe may be listed in an object's notes more than
+ * once, so be prepared to handle overlapping or redundant intervals.
+ */
+#define SYS_rrcall_notify_stap_semaphore_added 448
+/**
+ * The audit library calls SYS_rrcall_notify_stap_semaphore_removed once a
+ * batch of previously-incremented SystemTap semaphores have been decremented.
+ * The first parameter is the beginning of an address interval containing
+ * semaphores (inclusive) and the second parameter is the end of the address
+ * interval (exclusive).
+ *
+ * In practice a particular probe may be listed in an object's notes more than
+ * once, so be prepared to handle overlapping or redundant intervals.
+ */
+#define SYS_rrcall_notify_stap_semaphore_removed 449
 
 /* Define macros that let us compile a struct definition either "natively"
  * (when included by preload.c) or as a template over Arch for use by rr.
  */
-#ifdef RR_IMPLEMENT_PRELOAD
+#if defined(RR_IMPLEMENT_PRELOAD) || defined(RR_IMPLEMENT_AUDIT)
 #define TEMPLATE_ARCH
 #define PTR(T) T*
 #define PTR_ARCH(T) T*
@@ -260,8 +280,8 @@ struct preload_globals {
   /* 1 if chaos mode is enabled. DO NOT READ from rr during replay, because
      this field is not initialized in old traces. */
   unsigned char in_chaos;
-  /* Padding, currently unused; can be used later. */
-  unsigned char padding;
+  /* The signal to use for desched events */
+  unsigned char desched_sig;
   /* Number of cores to pretend we have. 0 means 1. rr sets this when
    * the preload library is initialized. */
   int pretend_num_cores;
@@ -633,13 +653,13 @@ inline static int is_proc_fd_dir(const char* filename) {
 /**
  * Returns nonzero if an attempted open() of |filename| can be syscall-buffered.
  * When this returns zero, the open must be forwarded to the rr process.
- * This is imperfect because it doesn't handle symbolic links, hard links,
- * files accessed with non-absolute paths, /proc mounted in differnet places,
- * etc etc etc. Handling those efficiently (no additional syscalls in
- * common cases) is a problem. Maybe we could afford fstat after every open...
+ * |filename| must be absolute.
+ * This is imperfect because it doesn't handle hard links and files (re)mounted
+ * in different places.
  */
 inline static int allow_buffered_open(const char* filename) {
-  return !is_blacklisted_filename(filename) && !is_gcrypt_deny_file(filename) &&
+  return filename &&
+         !is_blacklisted_filename(filename) && !is_gcrypt_deny_file(filename) &&
          !is_terminal(filename) && !is_proc_mem_file(filename) &&
          !is_proc_fd_dir(filename);
 }

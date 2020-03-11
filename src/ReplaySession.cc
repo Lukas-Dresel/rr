@@ -123,16 +123,14 @@ static void check_xsave_compatibility(const TraceReader& trace_in) {
   }
 
   if (tracee_xcr0 != our_xcr0) {
-    if (tracee_xsavec) {
-      LOG(warn) << "Trace XCR0 value " << HEX(tracee_xcr0) << " != our XCR0 "
-          << "value " << HEX(our_xcr0) << "; Replay will fail if the tracee "
-          << "used plain XSAVE";
-    } else if (!Flags::get().suppress_environment_warnings) {
-      // Tracee may have used XSAVE instructions which write different components
-      // to XSAVE instructions executed on our CPU. This will cause divergence.
+    if (!Flags::get().suppress_environment_warnings) {
+      // If the tracee used XSAVE instructions which write different components
+      // to XSAVE instructions executed on our CPU, or examines XCR0 directly,
+      // This will cause divergence. The dynamic linker examines XCR0 so this
+      // is nearly guaranteed.
       cerr << "Trace XCR0 value " << HEX(tracee_xcr0) << " != our XCR0 "
           << "value " << HEX(our_xcr0) << "; Replay will probably fail "
-          << "because glibc dynamic loader uses XSAVE\n\n";
+          << "because glibc dynamic loader examines XCR0\n\n";
     }
   }
 
@@ -201,6 +199,7 @@ ReplaySession::ReplaySession(const ReplaySession& other)
       cpuid_bug_detector(other.cpuid_bug_detector),
       last_siginfo_(other.last_siginfo_),
       flags_(other.flags_),
+      fast_forward_status(other.fast_forward_status),
       trace_start_time(other.trace_start_time) {}
 
 ReplaySession::~ReplaySession() {
@@ -446,7 +445,7 @@ Completion ReplaySession::cont_syscall_boundary(
   if (constraints.command == RUN_SINGLESTEP_FAST_FORWARD) {
     // ignore ticks_period. We can't add more than one tick during a
     // fast_forward so it doesn't matter.
-    did_fast_forward |= fast_forward_through_instruction(
+    fast_forward_status |= fast_forward_through_instruction(
         t, RESUME_SYSEMU_SINGLESTEP, constraints.stop_before_states);
   } else {
     ResumeRequest resume_how =
@@ -637,7 +636,7 @@ Completion ReplaySession::continue_or_step(ReplayTask* t,
     t->resume_execution(RESUME_SINGLESTEP, RESUME_WAIT, tick_request);
     handle_unrecorded_cpuid_fault(t, constraints);
   } else if (constraints.command == RUN_SINGLESTEP_FAST_FORWARD) {
-    did_fast_forward |= fast_forward_through_instruction(
+    fast_forward_status |= fast_forward_through_instruction(
         t, RESUME_SINGLESTEP, constraints.stop_before_states);
     handle_unrecorded_cpuid_fault(t, constraints);
   } else {
@@ -949,7 +948,7 @@ Completion ReplaySession::emulate_async_signal(
         // This state may not be relevant if we don't have the correct tick
         // count yet. But it doesn't hurt to push it on anyway.
         states.push_back(&regs);
-        did_fast_forward |=
+        fast_forward_status |=
             fast_forward_through_instruction(t, RESUME_SINGLESTEP, states);
         SIGTRAP_run_command = RUN_SINGLESTEP_FAST_FORWARD;
         check_pending_sig(t);
@@ -1349,7 +1348,7 @@ Completion ReplaySession::try_one_trace_step(
  * Task death during replay always goes through here (except for
  * Session::kill_all_tasks when we forcibly kill all tasks in the session at
  * once). |exit| and |exit_group| syscalls are both emulated so the real
- * task doesn't die until we reach the EXIT/UNSTABLE_EXIT events in the trace.
+ * task doesn't die until we reach the EXIT events in the trace.
  * This ensures the real tasks are alive and available as long as our Task
  * object exists, which simplifies code like Session cloning.
  *
@@ -1369,9 +1368,8 @@ static void end_task(ReplayTask* t) {
   // Enter the syscall.
   t->resume_execution(RESUME_CONT, RESUME_WAIT, RESUME_NO_TICKS);
   ASSERT(t, t->ptrace_event() == PTRACE_EVENT_EXIT);
-
-  t->stable_exit = true;
-  t->destroy();
+  t->detach();
+  delete t;
 }
 
 Completion ReplaySession::exit_task(ReplayTask* t) {
@@ -1563,7 +1561,7 @@ ReplayResult ReplaySession::replay_step(const StepConstraints& constraints) {
     return result;
   }
 
-  did_fast_forward = false;
+  fast_forward_status = FastForwardStatus();
 
   // Now we know |t| hasn't died, so save it in break_status.
   result.break_status.task = t;
@@ -1590,11 +1588,13 @@ ReplayResult ReplaySession::replay_step(const StepConstraints& constraints) {
                constraints.is_singlestep());
 
     check_approaching_ticks_target(t, constraints, result.break_status);
-    result.did_fast_forward = did_fast_forward;
+    result.did_fast_forward = fast_forward_status.did_fast_forward;
+    result.incomplete_fast_forward = fast_forward_status.incomplete_fast_forward;
     return result;
   }
 
-  result.did_fast_forward = did_fast_forward;
+  result.did_fast_forward = fast_forward_status.did_fast_forward;
+  result.incomplete_fast_forward = fast_forward_status.incomplete_fast_forward;
 
   switch (current_step.action) {
     case TSTEP_DETERMINISTIC_SIGNAL:

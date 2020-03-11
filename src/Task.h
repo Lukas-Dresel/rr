@@ -34,7 +34,6 @@ namespace rr {
 
 class AutoRemoteSyscalls;
 class RecordSession;
-class RecordTask;
 class ReplaySession;
 class ScopedFd;
 class Session;
@@ -133,11 +132,9 @@ public:
   typedef std::vector<WatchConfig> DebugRegs;
 
   /**
-   * We hide the destructor and require clients to call this instead. This
-   * lets us make virtual calls from within the destruction code. This
-   * does the actual PTRACE_DETACH and then calls the real destructor.
+   * Ptrace-detach the task.
    */
-  void destroy();
+  void detach();
 
   /**
    * This must be in an emulated syscall, entered through
@@ -177,6 +174,10 @@ public:
    * Stat |fd| in the context of this task's fd table.
    */
   struct stat stat_fd(int fd);
+  /**
+   * Lstat |fd| in the context of this task's fd table.
+   */
+  struct stat lstat_fd(int fd);
   /**
    * Open |fd| in the context of this task's fd table.
    */
@@ -680,9 +681,6 @@ public:
    * with a waitpid() call. Only applies to tasks which are dying, usually
    * due to a signal sent to the entire thread group. */
   bool unstable;
-  /* exit(), or exit_group() with one task, has been called, so
-   * the exit can be treated as stable. */
-  bool stable_exit;
 
   /* Imagine that task A passes buffer |b| to the read()
    * syscall.  Imagine that, after A is switched out for task B,
@@ -766,6 +764,7 @@ public:
                                  : scratch_ptr + scratch_size;
   }
   void setup_preload_thread_locals();
+  void setup_preload_thread_locals_from_clone(Task* origin);
   const ThreadLocals& fetch_preload_thread_locals();
   void activate_preload_thread_locals();
 
@@ -813,10 +812,11 @@ public:
     return address_of_last_execution_resume;
   }
 
+  virtual ~Task();
+
 protected:
   Task(Session& session, pid_t tid, pid_t rec_tid, uint32_t serial,
        SupportedArch a);
-  virtual ~Task();
 
   enum CloneReason {
     // Cloning a task in the same session due to tracee fork()/vfork()/clone()
@@ -844,6 +844,11 @@ protected:
    * Internal method called after the first wait() during a clone().
    */
   virtual void post_wait_clone(Task*, int) {}
+
+  /**
+   * Internal method called after the clone to fix up the new address space.
+   */
+  virtual bool post_vm_clone(CloneReason reason, int flags, Task* origin);
 
   template <typename Arch>
   void on_syscall_exit_arch(int syscallno, const Registers& regs);
@@ -965,7 +970,7 @@ protected:
                      const std::vector<std::string>& argv,
                      const std::vector<std::string>& envp, pid_t rec_tid = -1);
 
-  void maybe_workaround_singlestep_bug();
+  void work_around_KNL_string_singlestep_bug();
 
   void* preload_thread_locals();
 
@@ -988,6 +993,12 @@ protected:
   // cx register. If so, we record the orginal value here. See comments in
   // Task.cc
   uint64_t last_resume_orig_cx;
+  // The instruction type we're singlestepping through.
+  TrappedInstruction singlestepping_instruction;
+  // True if we set a breakpoint after a singlestepped CPUID instruction.
+  // We need this in addition to `singlestepping_instruction` because that
+  // might be CPUID but we failed to set the breakpoint.
+  bool did_set_breakpoint_after_cpuid;
   // True when we know via waitpid() that the task is stopped and we haven't
   // resumed it.
   bool is_stopped;

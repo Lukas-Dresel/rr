@@ -34,14 +34,6 @@ namespace rr {
 
 static __inline__ unsigned long long rdtsc(void) { return __rdtsc(); }
 
-template <typename Arch> static size_t sigaction_sigset_size_arch() {
-  return sizeof(typename Arch::kernel_sigset_t);
-}
-
-static size_t sigaction_sigset_size(SupportedArch arch) {
-  RR_ARCH_FUNCTION(sigaction_sigset_size_arch, arch);
-}
-
 static void restore_sighandler_if_not_default(RecordTask* t, int sig) {
   if (t->sig_disposition(sig) != SIGNAL_DEFAULT) {
     LOG(debug) << "Restoring signal handler for " << signal_name(sig);
@@ -205,7 +197,7 @@ static bool try_grow_map(RecordTask* t, siginfo_t* si) {
       t->vm()->map(t, new_start, it->map.start() - new_start, it->map.prot(),
                    it->map.flags() | MAP_ANONYMOUS, 0, string(),
                    KernelMapping::NO_DEVICE, KernelMapping::NO_INODE);
-  t->trace_writer().write_mapped_region(t, km, km.fake_stat());
+  t->trace_writer().write_mapped_region(t, km, km.fake_stat(), vector<TraceRemoteFd>());
   // No need to flush syscallbuf here. It's safe to map these pages "early"
   // before they're really needed.
   t->record_event(Event::grow_map(), RecordTask::DONT_FLUSH_SYSCALLBUF);
@@ -216,13 +208,15 @@ static bool try_grow_map(RecordTask* t, siginfo_t* si) {
 }
 
 void disarm_desched_event(RecordTask* t) {
-  if (ioctl(t->desched_fd, PERF_EVENT_IOC_DISABLE, 0)) {
+  if (t->desched_fd.is_open() &&
+      ioctl(t->desched_fd, PERF_EVENT_IOC_DISABLE, 0)) {
     FATAL() << "Failed to disarm desched event";
   }
 }
 
 void arm_desched_event(RecordTask* t) {
-  if (ioctl(t->desched_fd, PERF_EVENT_IOC_ENABLE, 0)) {
+  if (t->desched_fd.is_open() &&
+      ioctl(t->desched_fd, PERF_EVENT_IOC_ENABLE, 0)) {
     FATAL() << "Failed to disarm desched event";
   }
 }
@@ -320,8 +314,11 @@ bool handle_syscallbuf_breakpoint(RecordTask* t) {
  * to the tracee's latest state.
  */
 static void handle_desched_event(RecordTask* t, const siginfo_t* si) {
-  ASSERT(t, SYSCALLBUF_DESCHED_SIGNAL == si->si_signo && si->si_code == POLL_IN)
-      << "Tracee is using SIGPWR??? (siginfo=" << *si << ")";
+  ASSERT(t, t->session().syscallbuf_desched_sig() == si->si_signo && si->si_code == POLL_IN)
+      << "Tracee is using the syscallbuf signal ("
+      << signal_name(t->session().syscallbuf_desched_sig())
+      << ") ??? (siginfo=" << *si << ")\n"
+      << "Try recording with --syscall-buffer-sig=<UNUSED SIGNAL>";
 
   /* If the tracee isn't in the critical section where a desched
    * event is relevant, we can ignore it.  See the long comments
@@ -458,7 +455,7 @@ static void handle_desched_event(RecordTask* t, const siginfo_t* si) {
       LOG(debug) << " disabling breakpoints on untraced syscalls";
       continue;
     }
-    if (SYSCALLBUF_DESCHED_SIGNAL == sig ||
+    if (t->session().syscallbuf_desched_sig() == sig ||
         PerfCounters::TIME_SLICE_SIGNAL == sig || t->is_sig_ignored(sig)) {
       LOG(debug) << "  dropping ignored " << signal_name(sig);
       continue;
@@ -541,7 +538,17 @@ static bool is_safe_to_deliver_signal(RecordTask* t, siginfo_t* si) {
                << " because in traced syscall";
     return true;
   }
-  if (t->is_at_traced_syscall_entry()) {
+
+  // Don't deliver signals just before entering rrcall_notify_syscall_hook_exit.
+  // At that point, notify_on_syscall_hook_exit will be set, but we have
+  // passed the point at which syscallbuf code has checked that flag.
+  // Replay will set notify_on_syscall_hook_exit when we replay towards the
+  // rrcall_notify_syscall_hook_exit *after* handling this signal, but
+  // that will be too late for syscallbuf to notice.
+  // It's OK to delay signal delivery until after rrcall_notify_syscall_hook_exit
+  // anyway.
+  if (t->is_at_traced_syscall_entry() &&
+      !is_rrcall_notify_syscall_hook_exit_syscall(t->regs().syscallno(), t->arch())) {
     LOG(debug) << "Safe to deliver signal at " << t->ip()
                << " because at entry to traced syscall";
     return true;
@@ -619,7 +626,7 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
     // Since we're not undoing the kernel's changes, update our signal handler
     // state to match the kernel's.
     if (signal_was_blocked || t->is_sig_ignored(sig)) {
-      t->set_sig_handler_default(sig);
+      t->did_set_sig_handler_default(sig);
     }
   }
 
@@ -628,7 +635,7 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
      * those we *do not* want to (and cannot, most of the time)
      * step the tracee out of the syscallbuf code before
      * attempting to deliver the signal. */
-    if (SYSCALLBUF_DESCHED_SIGNAL == si->si_signo) {
+    if (t->session().syscallbuf_desched_sig() == si->si_signo) {
       handle_desched_event(t, si);
       return SIGNAL_HANDLED;
     }

@@ -258,7 +258,7 @@ remote_code_ptr AddressSpace::find_syscall_instruction(Task* t) {
 }
 
 static string find_rr_page_file(Task* t) {
-  string path = resource_path() + "bin/rr_page_";
+  string path = resource_path() + "share/rr/rr_page_";
   switch (t->arch()) {
     case x86:
       path += "32";
@@ -1453,13 +1453,13 @@ AddressSpace::AddressSpace(Session* session, const AddressSpace& o,
   // cloned address-space memory, so we don't need to do any more work here.
 }
 
-void AddressSpace::post_vm_clone(Task* t) {
+bool AddressSpace::post_vm_clone(Task* t) {
   if (has_mapping(preload_thread_locals_start()) &&
       (mapping_flags_of(preload_thread_locals_start()) &
        AddressSpace::Mapping::IS_THREAD_LOCALS) == 0) {
     // The tracee already has a mapping at this address that doesn't belong to
     // us. Don't touch it.
-    return;
+    return false;
   }
 
   // Otherwise, the preload_thread_locals mapping is non-existent or ours.
@@ -1470,6 +1470,7 @@ void AddressSpace::post_vm_clone(Task* t) {
                                   "preload_thread_locals");
   mapping_flags_of(preload_thread_locals_start()) |=
       AddressSpace::Mapping::IS_THREAD_LOCALS;
+  return true;
 }
 
 static bool try_split_unaligned_range(MemoryRange& range, size_t bytes,
@@ -1884,7 +1885,7 @@ static MemoryRange choose_global_exclusion_range() {
   uint64_t r_addr = r & ((uint64_t(1) << bits) - 1);
   r_addr = min(r_addr, (uint64_t(1) << bits) - range_size);
   remote_ptr<void> addr = floor_page_size(remote_ptr<void>(r_addr));
-  return MemoryRange(addr, range_size);
+  return MemoryRange(addr, (uintptr_t)range_size);
 }
 
 remote_ptr<void> AddressSpace::chaos_mode_find_free_memory(RecordTask* t,
@@ -1946,12 +1947,12 @@ remote_ptr<void> AddressSpace::chaos_mode_find_free_memory(RecordTask* t,
     if (r.intersects(global_exclusion_range)) {
       continue;
     }
-    if (t->session().asan_active()) {
+    if (t->session().asan_active() && sizeof(size_t) == 8) {
       LOG(debug) << "Checking ASAN shadow";
-      MemoryRange asan_shadow(remote_ptr<void>(0x00007fff7000),
-                              remote_ptr<void>(0x10007fff8000));
-      MemoryRange asan_allocator_reserved(remote_ptr<void>(0x600000000000),
-                                          remote_ptr<void>(0x640000000000));
+      MemoryRange asan_shadow(remote_ptr<void>((uintptr_t)0x00007fff7000LL),
+                              remote_ptr<void>((uintptr_t)0x10007fff8000LL));
+      MemoryRange asan_allocator_reserved(remote_ptr<void>((uintptr_t)0x600000000000LL),
+                                          remote_ptr<void>((uintptr_t)0x640000000000LL));
       if (r.intersects(asan_shadow) || r.intersects(asan_allocator_reserved)) {
         continue;
       }
@@ -1980,6 +1981,40 @@ remote_ptr<void> AddressSpace::find_free_memory(size_t required_space,
     current = next;
   }
   return current->map.end();
+}
+
+void AddressSpace::add_stap_semaphore_range(Task* task, MemoryRange range) {
+  ASSERT(task, range.start() != range.end())
+    << "Unexpected zero-length SystemTap semaphore range: " << range;
+  ASSERT(task, (range.size() & 1) == 0)
+    << "Invalid SystemTap semaphore range at "
+    << range
+    << ": size is not a multiple of the size of a STap semaphore!";
+
+  auto ptr = range.start().cast<uint16_t>(),
+       end = range.end().cast<uint16_t>();
+  for (; ptr < end; ++ptr) {
+    stap_semaphores.insert(ptr);
+  }
+}
+
+void AddressSpace::remove_stap_semaphore_range(Task* task, MemoryRange range) {
+  ASSERT(task, range.start() != range.end())
+    << "Unexpected zero-length SystemTap semaphore range: " << range;
+  ASSERT(task, (range.size() & 1) == 0)
+    << "Invalid SystemTap semaphore range at "
+    << range
+    << ": size is not a multiple of the size of a STap semaphore!";
+
+  auto ptr = range.start().cast<uint16_t>(),
+       end = range.end().cast<uint16_t>();
+  for (; ptr < end; ++ptr) {
+    stap_semaphores.erase(ptr);
+  }
+}
+
+bool AddressSpace::is_stap_semaphore(remote_ptr<uint16_t> addr) {
+  return stap_semaphores.find(addr) != stap_semaphores.end();
 }
 
 } // namespace rr

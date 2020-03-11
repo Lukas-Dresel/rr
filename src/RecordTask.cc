@@ -161,6 +161,7 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       time_at_start_of_last_timeslice(0),
       priority(0),
       in_round_robin_queue(false),
+      stable_exit(false),
       emulated_ptracer(nullptr),
       emulated_ptrace_event_msg(0),
       emulated_ptrace_options(0),
@@ -169,7 +170,6 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       emulated_ptrace_SIGCHLD_pending(false),
       emulated_SIGCHLD_pending(false),
       emulated_ptrace_seized(false),
-      emulated_ptrace_queued_exit_stop(false),
       in_wait_type(WAIT_TYPE_NONE),
       in_wait_pid(0),
       emulated_stop_type(NOT_STOPPED),
@@ -182,7 +182,6 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       prctl_seccomp_status(0),
       robust_futex_list_len(0),
       own_namespace_rec_tid(0),
-      exit_code(0),
       termination_signal(0),
       tsc_mode(PR_TSC_ENABLE),
       cpuid_mode(1),
@@ -192,7 +191,8 @@ RecordTask::RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
       break_at_syscallbuf_untraced_syscalls(false),
       break_at_syscallbuf_final_instruction(false),
       next_pmc_interrupt_is_for_user(false),
-      did_record_robust_futex_changes(false) {
+      did_record_robust_futex_changes(false),
+      waiting_for_reap(false) {
   push_event(Event::sentinel());
   if (session.tasks().empty()) {
     // Initial tracee. It inherited its state from this process, so set it up.
@@ -224,6 +224,20 @@ RecordTask::~RecordTask() {
     t->emulated_stop_type = NOT_STOPPED;
   }
 
+  // We expect tasks to usually exit by a call to exit() or
+  // exit_group(), so it's not helpful to warn about that.
+  if (EV_SENTINEL != ev().type() &&
+      (pending_events.size() > 2 ||
+       !(ev().type() == EV_SYSCALL &&
+         (is_exit_syscall(ev().Syscall().number, ev().Syscall().regs.arch()) ||
+          is_exit_group_syscall(ev().Syscall().number,
+                                ev().Syscall().regs.arch()))))) {
+    LOG(warn) << tid << " still has pending events.  From top down:";
+    log_pending_events();
+  }
+}
+
+void RecordTask::record_exit_event() {
   // Task::destroy has already done PTRACE_DETACH so the task can complete
   // exiting.
   // The kernel explicitly only clears the futex if the address space is shared.
@@ -259,18 +273,6 @@ RecordTask::~RecordTask() {
   // e.g. it could be in the middle of syscallbuf code that's supposed to be
   // atomic. For the same reasons don't allow syscallbuf to be reset here.
   record_event(Event::exit(), DONT_FLUSH_SYSCALLBUF, DONT_RESET_SYSCALLBUF);
-
-  // We expect tasks to usually exit by a call to exit() or
-  // exit_group(), so it's not helpful to warn about that.
-  if (EV_SENTINEL != ev().type() &&
-      (pending_events.size() > 2 ||
-       !(ev().type() == EV_SYSCALL &&
-         (is_exit_syscall(ev().Syscall().number, ev().Syscall().regs.arch()) ||
-          is_exit_group_syscall(ev().Syscall().number,
-                                ev().Syscall().regs.arch()))))) {
-    LOG(warn) << tid << " still has pending events.  From top down:";
-    log_pending_events();
-  }
 }
 
 void RecordTask::futex_wait(remote_ptr<int> futex, int val, bool* ok) {
@@ -407,6 +409,11 @@ template <typename Arch> static void do_preload_init_arch(RecordTask* t) {
   t->write_mem(cores_ptr, cores);
   t->record_local(cores_ptr, &cores);
 
+  auto desched_sig = t->session().syscallbuf_desched_sig();
+  auto desched_sig_ptr = REMOTE_PTR_FIELD(params.globals.rptr(), desched_sig);
+  t->write_mem(desched_sig_ptr, desched_sig);
+  t->record_local(desched_sig_ptr, &desched_sig);
+
   uint64_t random_seed;
   do {
     random_seed = rand() | (uint64_t(rand()) << 32);
@@ -462,11 +469,12 @@ template <typename Arch> void RecordTask::init_buffers_arch() {
     args.syscallbuf_ptr = syscallbuf_child;
     desched_fd_child = args.desched_counter_fd;
     // Prevent the child from closing this fd
-    fds->add_monitor(desched_fd_child, new PreserveFileMonitor());
+    fds->add_monitor(this, desched_fd_child, new PreserveFileMonitor());
     desched_fd = remote.retrieve_fd(desched_fd_child);
 
     auto record_in_trace = trace_writer().write_mapped_region(
         this, syscallbuf_km, syscallbuf_km.fake_stat(),
+        vector<TraceRemoteFd>(),
         TraceWriter::RR_BUFFER_MAPPING);
     ASSERT(this, record_in_trace == TraceWriter::DONT_RECORD_IN_TRACE);
 
@@ -490,7 +498,7 @@ template <typename Arch> void RecordTask::init_buffers_arch() {
           // Prevent the child from closing this fd. We're going to close it
           // ourselves and we don't want the child closing it and then reopening
           // its own file with this fd.
-          fds->add_monitor(cloned_file_data_fd_child,
+          fds->add_monitor(this, cloned_file_data_fd_child,
                            new PreserveFileMonitor());
           remote.infallible_syscall(syscall_number_for_close(arch()),
                                     cloned_file_data);
@@ -599,8 +607,7 @@ void RecordTask::will_resume_execution(ResumeRequest, WaitRequest,
     // because blocking it seems to cause problems for some hardware/kernel
     // configurations (see https://github.com/mozilla/rr/issues/1979),
     // causing them to stop counting events.
-    sig_set_t sigset = ~(signal_bit(SYSCALLBUF_DESCHED_SIGNAL) |
-                         signal_bit(PerfCounters::TIME_SLICE_SIGNAL));
+    sig_set_t sigset = ~session().rr_signal_mask();
     if (sig) {
       // We're injecting a signal, so make sure that signal is unblocked.
       sigset &= ~signal_bit(sig);
@@ -680,8 +687,8 @@ void RecordTask::did_wait() {
 
   if (stashed_signals_blocking_more_signals) {
     // Saved 'blocked_sigs' must still be correct regardless of syscallbuf
-    // state, because we do not allow stashed_signals_blocking_more_signals to
-    // hold across syscalls (traced or untraced) that change the signal mask.
+    // state, because we do not allow stashed_signals_blocking_more_signals
+    // to hold across syscalls (traced or untraced) that change the signal mask.
     ASSERT(this, !blocked_sigs_dirty);
     xptrace(PTRACE_SETSIGMASK, remote_ptr<void>(8), &blocked_sigs);
   } else if (syscallbuf_child) {
@@ -760,6 +767,22 @@ void RecordTask::force_emulate_ptrace_stop(WaitStatus status) {
   // return that result immediately.
 }
 
+bool RecordTask::do_ptrace_exit_stop(WaitStatus exit_status) {
+  // Notify ptracer of the exit if it's not going to receive it from the
+  // kernel because it's not the parent. (The kernel has similar logic to
+  // deliver two stops in this case.)
+  if (emulated_ptracer &&
+      (is_clone_child() ||
+       get_parent_pid() != emulated_ptracer->real_tgid())) {
+    // The task is dead so treat it as not stopped so we can deliver a new stop
+    emulated_stop_type = NOT_STOPPED;
+    // This is a bit wrong; this is an exit stop, not a signal/ptrace stop.
+    emulate_ptrace_stop(exit_status);
+    return true;
+  }
+  return false;
+}
+
 void RecordTask::send_synthetic_SIGCHLD_if_necessary() {
   RecordTask* wake_task = nullptr;
   bool need_signal = false;
@@ -829,6 +852,7 @@ void RecordTask::send_synthetic_SIGCHLD_if_necessary() {
                   SIGCHLD, &si);
     ASSERT(this, ret == 0);
     if (wake_task->is_sig_blocked(SIGCHLD)) {
+      LOG(debug) << "SIGCHLD is blocked, kicking it out of the syscall";
       // Just sending SIGCHLD won't wake it up. Send it a TIME_SLICE_SIGNAL
       // as well to make sure it exits a blocking syscall. We ensure those
       // can never be blocked.
@@ -858,11 +882,24 @@ bool RecordTask::set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si) {
     return true;
   }
 
-  if (is_syscall_restart()) {
-    // ptrace generated signals don't interrupt syscalls such as wait.
-    // Return false to tell the caller to defer the signal and resume
-    // the syscall.
-    return false;
+  if (is_syscall_restart() && EV_SYSCALL_INTERRUPTION == ev().type()) {
+    int syscallno = regs().original_syscallno();
+    SupportedArch syscall_arch = ev().Syscall().arch();
+    if (is_waitpid_syscall(syscallno, syscall_arch) ||
+        is_waitid_syscall(syscallno, syscall_arch) ||
+        is_wait4_syscall(syscallno, syscall_arch)) {
+      // Wait-like syscalls always check for notifications from waited-for processes
+      // before they check for pending signals. So, if the tracee has a pending
+      // notification that also generated a signal, the wait syscall will return
+      // normally rather than returning with ERESTARTSYS etc. (The signal will
+      // be dequeued and any handler run on the return to userspace, however.)
+      // We need to emulate this by deferring our synthetic ptrace signal
+      // until after the wait syscall has returned.
+      LOG(debug) << "Deferring signal because we're in a wait";
+      // Return false to tell the caller to defer the signal and resume
+      // the syscall.
+      return false;
+    }
   }
 
   for (RecordTask* tracee : emulated_ptrace_tracees) {
@@ -1160,11 +1197,17 @@ void RecordTask::update_sigaction(const Registers& regs) {
 }
 
 sig_set_t RecordTask::read_sigmask_from_process() {
-  sig_set_t mask;
-  long ret = fallible_ptrace(PTRACE_GETSIGMASK,
-                             remote_ptr<void>(sizeof(sig_set_t)), &mask);
-  if (ret >= 0) {
-    return mask;
+  // During syscall interruptions, PTRACE_GETSIGMASK may return the sigmask that is going
+  // to be restored, not the kernel's current (internal) sigmask, which is what
+  // /proc/.../status reports. Always go with what /proc/.../status reports. See
+  // https://github.com/torvalds/linux/commit/fcfc2aa0185f4a731d05a21e9f359968fdfd02e7
+  if (!at_may_restart_syscall()) {
+    sig_set_t mask;
+    long ret = fallible_ptrace(PTRACE_GETSIGMASK,
+                               remote_ptr<void>(sizeof(sig_set_t)), &mask);
+    if (ret >= 0) {
+      return mask;
+    }
   }
 
   auto results = read_proc_status_fields(tid, "SigBlk");
@@ -1181,7 +1224,38 @@ sig_set_t RecordTask::get_sigmask() {
   return blocked_sigs;
 }
 
+void RecordTask::unblock_signal(int sig) {
+  sig_set_t mask = get_sigmask();
+  mask &= ~signal_bit(sig);
+  int ret = fallible_ptrace(PTRACE_SETSIGMASK, remote_ptr<void>(8), &mask);
+  if (ret < 0) {
+    if (errno == EIO) {
+      FATAL() << "PTRACE_SETSIGMASK not supported; rr requires Linux kernel >= 3.11";
+    }
+    ASSERT(this, errno == EINVAL);
+  } else {
+    LOG(debug) << "Set signal mask to block all signals (bar "
+               << "SYSCALLBUF_DESCHED_SIGNAL/TIME_SLICE_SIGNAL) while we "
+               << " have a stashed signal";
+  }
+  invalidate_sigmask();
+}
+
 void RecordTask::set_sig_handler_default(int sig) {
+  did_set_sig_handler_default(sig);
+  // This could happen during a syscallbuf untraced syscall. In that case
+  // our remote syscall here could trigger a desched signal if that event
+  // is armed, making progress impossible. Disarm the event now.
+  disarm_desched_event(this);
+  AutoRemoteSyscalls remote(this);
+  Sighandler& h = sighandlers->get(sig);
+  AutoRestoreMem mem(remote, h.sa.data(), h.sa.size());
+  remote.infallible_syscall(syscall_number_for_rt_sigaction(arch()),
+      sig, mem.get().as_int(), nullptr,
+      sigaction_sigset_size(arch()));
+}
+
+void RecordTask::did_set_sig_handler_default(int sig) {
   Sighandler& h = sighandlers->get(sig);
   reset_handler(&h, arch());
 }
@@ -1229,7 +1303,7 @@ void RecordTask::stash_sig() {
   int sig = stop_sig();
   ASSERT(this, sig);
   // Callers should avoid passing SYSCALLBUF_DESCHED_SIGNAL in here.
-  ASSERT(this, sig != SYSCALLBUF_DESCHED_SIGNAL);
+  ASSERT(this, sig != session().syscallbuf_desched_sig());
   // multiple non-RT signals coalesce
   if (sig < SIGRTMIN) {
     for (auto it = stashed_signals.begin(); it != stashed_signals.end(); ++it) {
@@ -1256,14 +1330,20 @@ void RecordTask::stash_synthetic_sig(const siginfo_t& si,
   int sig = si.si_signo;
   DEBUG_ASSERT(sig);
   // Callers should avoid passing SYSCALLBUF_DESCHED_SIGNAL in here.
-  DEBUG_ASSERT(sig != SYSCALLBUF_DESCHED_SIGNAL);
+  DEBUG_ASSERT(sig != session().syscallbuf_desched_sig());
   // multiple non-RT signals coalesce
   if (sig < SIGRTMIN) {
     for (auto it = stashed_signals.begin(); it != stashed_signals.end(); ++it) {
       if (it->siginfo.si_signo == sig) {
-        LOG(debug) << "discarding stashed signal " << sig
-                   << " since we already have one pending";
-        return;
+        if (deterministic == DETERMINISTIC_SIG &&
+            it->deterministic == NONDETERMINISTIC_SIG) {
+          stashed_signals.erase(it);
+          break;
+        } else {
+          LOG(debug) << "discarding stashed signal " << sig
+                     << " since we already have one pending";
+          return;
+        }
       }
     }
   }
@@ -1285,13 +1365,13 @@ bool RecordTask::has_stashed_sig(int sig) const {
   return false;
 }
 
-bool RecordTask::has_stashed_sig_not_synthetic_SIGCHLD() const {
+const siginfo_t* RecordTask::stashed_sig_not_synthetic_SIGCHLD() const {
   for (auto it = stashed_signals.begin(); it != stashed_signals.end(); ++it) {
     if (!is_synthetic_SIGCHLD(it->siginfo)) {
-      return true;
+      return &it->siginfo;
     }
   }
-  return false;
+  return nullptr;
 }
 
 void RecordTask::pop_stash_sig(const StashedSignal* stashed) {
@@ -1507,8 +1587,8 @@ void RecordTask::record_remote(remote_ptr<void> addr, ssize_t num_bytes) {
   trace_writer().write_raw(rec_tid, buf.data(), num_bytes, addr);
 }
 
-void RecordTask::record_remote_writeable(remote_ptr<void> addr,
-                                         ssize_t num_bytes) {
+void RecordTask::record_remote_writable(remote_ptr<void> addr,
+                                        ssize_t num_bytes) {
   ASSERT(this, num_bytes >= 0);
 
   remote_ptr<void> p = addr;
@@ -1847,5 +1927,21 @@ void RecordTask::maybe_restore_original_syscall_registers() {
   RR_ARCH_FUNCTION(maybe_restore_original_syscall_registers_arch, arch(), this,
                    preload_thread_locals());
 }
+
+bool RecordTask::post_vm_clone(CloneReason reason, int flags, Task* origin) {
+  if (Task::post_vm_clone(reason, flags, origin)) {
+    KernelMapping preload_thread_locals_mapping =
+      vm()->mapping_of(AddressSpace::preload_thread_locals_start()).map;
+    auto mode = trace_writer().write_mapped_region(
+      this, preload_thread_locals_mapping,
+      preload_thread_locals_mapping.fake_stat(),
+      vector<TraceRemoteFd>(),
+      TraceWriter::RR_BUFFER_MAPPING);
+    ASSERT(this, mode == TraceWriter::DONT_RECORD_IN_TRACE);
+    return true;
+  }
+
+  return false;
+};
 
 } // namespace rr

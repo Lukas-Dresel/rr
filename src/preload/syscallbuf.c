@@ -45,6 +45,7 @@
  * wrapper.
  */
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -465,7 +466,7 @@ static int open_desched_event_counter(size_t nr_descheds, pid_t tid) {
   if (privileged_untraced_fcntl(fd, F_SETOWN_EX, &own)) {
     fatal("Failed to fcntl(SETOWN_EX) the desched counter to this");
   }
-  if (privileged_untraced_fcntl(fd, F_SETSIG, SYSCALLBUF_DESCHED_SIGNAL)) {
+  if (privileged_untraced_fcntl(fd, F_SETSIG, globals.desched_sig)) {
     fatal("Failed to fcntl(SETSIG) the desched counter");
   }
 
@@ -618,6 +619,11 @@ static void __attribute__((constructor)) init_process(void) {
       6,
       { 0xc3, 0x0f, 0x1f, 0x44, 0x00, 0x00 },
       (uintptr_t)_syscall_hook_trampoline_c3_nop },
+    /* glibc-2.29-15.fc30.x86_64 getpid has 'syscall' followed by 'retq; nopl 0x0(%rax) */
+    { 1,
+      5,
+      { 0xc3, 0x0f, 0x1f, 0x40, 0x00 },
+      (uintptr_t)_syscall_hook_trampoline_c3_nop },
     /* liblsan internal_open has 'syscall' followed by 'retq; nopl (%rax) */
     { 1,
       4,
@@ -627,6 +633,11 @@ static void __attribute__((constructor)) init_process(void) {
     { 1,
       3,
       { 0xc3, 0x66, 0x90 },
+      (uintptr_t)_syscall_hook_trampoline_c3_nop },
+    /* Go runtime has 'syscall' followed by 'retq; int3; int3 */
+    { 1,
+      3,
+      { 0xc3, 0xcc, 0xcc },
       (uintptr_t)_syscall_hook_trampoline_c3_nop },
   };
 #else
@@ -866,7 +877,7 @@ static int start_commit_buffered_syscall(int syscallno, void* record_end,
       si.si_pid = pid;
       si.si_uid = uid;
       privileged_untraced_syscall4(SYS_rt_tgsigqueueinfo, pid, tid,
-                                   SYSCALLBUF_DESCHED_SIGNAL,
+                                   globals.desched_sig,
                                    &si);
     }
   }
@@ -1694,6 +1705,55 @@ static long sys_mprotect(const struct syscall_info* call) {
   return commit_raw_syscall(syscallno, ptr, ret);
 }
 
+static int supported_open(const char* file_name, int flags) {
+  if (is_gcrypt_deny_file(file_name)) {
+    /* This needs to be a traced syscall. We want to return an
+       open file even if the file doesn't exist and the untraced syscall
+       returns ENOENT. */
+    return 0;
+  }
+  if (flags & O_DIRECT) {
+    /* O_DIRECT needs to go to rr so we can blacklist the file for
+       syscall buffering. */
+    return 0;
+  }
+  /* Writeable opens need to go to rr to be checked in case
+     they could write to a mapped file.
+     But if they're O_EXCL | O_CREAT, a new file must be created
+     so that will be fine. */
+  return !(flags & (O_RDWR | O_WRONLY)) ||
+    (flags & (O_EXCL | O_CREAT)) == (O_EXCL | O_CREAT);
+}
+
+static long sys_readlink(const struct syscall_info* call);
+
+static int check_file_open_ok(const struct syscall_info* call, int ret, int did_abort) {
+  if (did_abort || ret < 0) {
+    return ret;
+  }
+  char buf[100];
+  sprintf(buf, "/proc/self/fd/%d", ret);
+  char link[PATH_MAX];
+  struct syscall_info readlink_call =
+    { SYS_readlink, { (long)buf, (long)link, sizeof(link), 0, 0, 0 } };
+  long link_ret = sys_readlink(&readlink_call);
+  if (link_ret >= 0 && link_ret < (ssize_t)sizeof(link)) {
+    link[link_ret] = 0;
+    if (allow_buffered_open(link)) {
+      return ret;
+    }
+  }
+  /* Clean up by closing the file descriptor we should not have opened and
+     opening it again, traced this time.
+     Use a privileged traced syscall for the close to ensure it
+     can't fail due to lack of privilege.
+     We could try an untraced close syscall here, falling back to traced
+     syscall, but that's a bit more complicated and we're already on
+     the slow (and hopefully rare) path. */
+  privileged_traced_syscall1(SYS_close, ret);
+  return traced_raw_syscall(call);
+}
+
 static long sys_open(const struct syscall_info* call) {
   if (force_traced_syscall_for_chaos_mode()) {
     /* Opening a FIFO could unblock a higher priority task */
@@ -1709,9 +1769,7 @@ static long sys_open(const struct syscall_info* call) {
 
   assert(syscallno == call->no);
 
-  /* The strcmp()s done here are OK because we're not in the
-   * critical section yet. */
-  if (!allow_buffered_open(pathname)) {
+  if (!supported_open(pathname, flags)) {
     return traced_raw_syscall(call);
   }
 
@@ -1721,7 +1779,9 @@ static long sys_open(const struct syscall_info* call) {
   }
 
   ret = untraced_syscall3(syscallno, pathname, flags, mode);
-  return commit_raw_syscall(syscallno, ptr, ret);
+  int did_abort = buffer_hdr()->abort_commit;
+  ret = commit_raw_syscall(syscallno, ptr, ret);
+  return check_file_open_ok(call, ret, did_abort);
 }
 
 static long sys_openat(const struct syscall_info* call) {
@@ -1740,14 +1800,7 @@ static long sys_openat(const struct syscall_info* call) {
 
   assert(syscallno == call->no);
 
-  /* The strcmp()s done here are OK because we're not in the
-   * critical section yet.
-   * Make non-AT_FDCWD calls with relative paths take the rr path so we can
-   * handle things correctly. New glibc open() implementation uses openat with
-   * AT_FDCWD.
-   */
-  int treat_as_open = dirfd == AT_FDCWD || pathname[0] == '/';
-  if (!treat_as_open || !allow_buffered_open(pathname)) {
+  if (!supported_open(pathname, flags)) {
     return traced_raw_syscall(call);
   }
 
@@ -1757,7 +1810,9 @@ static long sys_openat(const struct syscall_info* call) {
   }
 
   ret = untraced_syscall4(syscallno, dirfd, pathname, flags, mode);
-  return commit_raw_syscall(syscallno, ptr, ret);
+  int did_abort = buffer_hdr()->abort_commit;
+  ret = commit_raw_syscall(syscallno, ptr, ret);
+  return check_file_open_ok(call, ret, did_abort);
 }
 
 /**
@@ -2057,6 +2112,32 @@ static long sys_readlink(const struct syscall_info* call) {
   }
 
   ret = untraced_syscall3(syscallno, path, buf2, bufsiz);
+  ptr = copy_output_buffer(ret, ptr, buf, buf2);
+  return commit_raw_syscall(syscallno, ptr, ret);
+}
+
+static long sys_readlinkat(const struct syscall_info* call) {
+  const int syscallno = SYS_readlinkat;
+  int dirfd = call->args[0];
+  const char* path = (const char*)call->args[1];
+  char* buf = (char*)call->args[2];
+  int bufsiz = call->args[3];
+
+  void* ptr = prep_syscall();
+  char* buf2 = NULL;
+  long ret;
+
+  assert(syscallno == call->no);
+
+  if (buf && bufsiz > 0) {
+    buf2 = ptr;
+    ptr += bufsiz;
+  }
+  if (!start_commit_buffered_syscall(syscallno, ptr, WONT_BLOCK)) {
+    return traced_raw_syscall(call);
+  }
+
+  ret = untraced_syscall4(syscallno, dirfd, path, buf2, bufsiz);
   ptr = copy_output_buffer(ret, ptr, buf, buf2);
   return commit_raw_syscall(syscallno, ptr, ret);
 }
@@ -2704,7 +2785,7 @@ static long sys_rt_sigprocmask(const struct syscall_info* call) {
     // SIGPWR(SYSCALLBUF_DESCHED_SIGNAL) are used by rr
     modified_set &=
         ~(((uint64_t)1) << (SIGSTKFLT - 1)) &
-        ~(((uint64_t)1) << (SYSCALLBUF_DESCHED_SIGNAL - 1));
+        ~(((uint64_t)1) << (globals.desched_sig - 1));
     set = &modified_set;
   }
 
@@ -2814,6 +2895,7 @@ static long syscall_hook_internal(const struct syscall_info* call) {
     CASE(quotactl);
     CASE(read);
     CASE(readlink);
+    CASE(readlinkat);
 #if defined(SYS_recvfrom)
     CASE(recvfrom);
 #endif

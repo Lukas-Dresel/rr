@@ -175,13 +175,13 @@ public:
       throw IOException();
     }
   }
-  virtual kj::ArrayPtr<const byte> tryGetReadBuffer() {
+  virtual kj::ArrayPtr<const capnp::byte> tryGetReadBuffer() {
     const uint8_t* p;
     size_t size;
     if (!reader.get_buffer(&p, &size)) {
       throw IOException();
     }
-    return kj::ArrayPtr<const byte>(p, size);
+    return kj::ArrayPtr<const capnp::byte>(p, size);
   }
 
 private:
@@ -223,12 +223,12 @@ bool TraceReader::good() const {
   return true;
 }
 
-static kj::ArrayPtr<const byte> str_to_data(const string& str) {
-  return kj::ArrayPtr<const byte>(reinterpret_cast<const byte*>(str.data()),
-                                  str.size());
+static kj::ArrayPtr<const capnp::byte> str_to_data(const string& str) {
+  return kj::ArrayPtr<const capnp::byte>(
+      reinterpret_cast<const capnp::byte*>(str.data()), str.size());
 }
 
-static string data_to_str(const kj::ArrayPtr<const byte>& data) {
+static string data_to_str(const kj::ArrayPtr<const capnp::byte>& data) {
   if (memchr(data.begin(), 0, data.size())) {
     FATAL() << "Invalid string: contains null character";
   }
@@ -481,6 +481,8 @@ void TraceWriter::write_frame(RecordTask* t, const Event& ev,
           auto opened = e.opened[i];
           o.setFd(opened.fd);
           o.setPath(str_to_data(opened.path));
+          o.setDevice(opened.device);
+          o.setInode(opened.inode);
         }
       }
       break;
@@ -617,8 +619,12 @@ TraceFrame TraceReader::read_frame() {
           auto open = data.getOpenedFds();
           syscall_ev.opened.resize(open.size());
           for (size_t i = 0; i < open.size(); ++i) {
-            syscall_ev.opened[i].fd = check_fd(open[i].getFd());
-            syscall_ev.opened[i].path = data_to_str(open[i].getPath());
+            auto& opened = syscall_ev.opened[i];
+            const auto& o = open[i];
+            opened.fd = check_fd(o.getFd());
+            opened.path = data_to_str(o.getPath());
+            opened.device = o.getDevice();
+            opened.inode = o.getInode();
           }
           break;
         }
@@ -834,7 +840,8 @@ static bool starts_with(const string& s, const string& with) {
 
 TraceWriter::RecordInTrace TraceWriter::write_mapped_region(
     RecordTask* t, const KernelMapping& km, const struct stat& stat,
-    MappingOrigin origin) {
+    const vector<TraceRemoteFd>& extra_fds, MappingOrigin origin,
+    bool skip_monitoring_mapped_fd) {
   MallocMessageBuilder map_msg;
   trace::MMap::Builder map = map_msg.initRoot<trace::MMap>();
   map.setFrameTime(global_time);
@@ -851,6 +858,14 @@ TraceWriter::RecordInTrace TraceWriter::write_mapped_region(
   map.setStatGid(stat.st_gid);
   map.setStatSize(stat.st_size);
   map.setStatMTime(stat.st_mtime);
+  auto fds = map.initExtraFds(extra_fds.size());
+  for (size_t i = 0; i < extra_fds.size(); ++i) {
+    auto e = fds[i];
+    auto& r = extra_fds[i];
+    e.setTid(r.tid);
+    e.setFd(r.fd);
+  }
+  map.setSkipMonitoringMappedFd(skip_monitoring_mapped_fd);
   auto src = map.getSource();
   string backing_file_name;
 
@@ -927,7 +942,8 @@ TraceWriter::RecordInTrace TraceWriter::write_mapped_region(
 }
 
 void TraceWriter::write_mapped_region_to_alternative_stream(
-    CompressedWriter& mmaps, const MappedData& data, const KernelMapping& km) {
+    CompressedWriter& mmaps, const MappedData& data, const KernelMapping& km,
+    const vector<TraceRemoteFd>& extra_fds, bool skip_monitoring_mapped_fd) {
   MallocMessageBuilder map_msg;
   trace::MMap::Builder map = map_msg.initRoot<trace::MMap>();
 
@@ -941,6 +957,14 @@ void TraceWriter::write_mapped_region_to_alternative_stream(
   map.setFlags(km.flags());
   map.setFileOffsetBytes(km.file_offset_bytes());
   map.setStatSize(data.file_size_bytes);
+  auto fds = map.initExtraFds(extra_fds.size());
+  for (size_t i = 0; i < extra_fds.size(); ++i) {
+    auto e = fds[i];
+    auto& r = extra_fds[i];
+    e.setTid(r.tid);
+    e.setFd(r.fd);
+  }
+  map.setSkipMonitoringMappedFd(skip_monitoring_mapped_fd);
   auto src = map.getSource();
   switch (data.source) {
     case TraceReader::SOURCE_ZERO:
@@ -967,7 +991,9 @@ void TraceWriter::write_mapped_region_to_alternative_stream(
 
 KernelMapping TraceReader::read_mapped_region(MappedData* data, bool* found,
                                               ValidateSourceFile validate,
-                                              TimeConstraint time_constraint) {
+                                              TimeConstraint time_constraint,
+                                              vector<TraceRemoteFd>* extra_fds,
+                                              bool* skip_monitoring_mapped_fd) {
   if (found) {
     *found = false;
   }
@@ -998,6 +1024,16 @@ KernelMapping TraceReader::read_mapped_region(MappedData* data, bool* found,
     }
     data->data_offset_bytes = 0;
     data->file_size_bytes = map.getStatSize();
+    if (extra_fds) {
+      const auto& fds = map.getExtraFds();
+      for (size_t i = 0; i < fds.size(); ++i) {
+        const auto& f = fds[i];
+        extra_fds->push_back({ f.getTid(), f.getFd() });
+      }
+    }
+    if (skip_monitoring_mapped_fd) {
+      *skip_monitoring_mapped_fd = map.getSkipMonitoringMappedFd();
+    }
     auto src = map.getSource();
     switch (src.which()) {
       case trace::MMap::Source::Which::ZERO:
@@ -1141,8 +1177,7 @@ static string make_trace_dir(const string& exe_path, const string& output_trace_
     return dir;
   }
 
-  // never should reach that
-  return nullptr;
+  return ""; // not reached
 }
 
 #define STR_HELPER(x) #x
@@ -1168,7 +1203,7 @@ TraceWriter::TraceWriter(const std::string& file_name,
   }
 
   string ver_path = incomplete_version_path();
-  version_fd = ScopedFd(ver_path.c_str(), O_RDWR | O_CREAT, 0600);
+  version_fd = ScopedFd(ver_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
   if (!version_fd.is_open()) {
     FATAL() << "Unable to create " << ver_path;
   }
@@ -1238,6 +1273,7 @@ void TraceWriter::close(CloseStatus status, const TraceUuid* uuid) {
   header.setTicksSemantics(
     to_trace_ticks_semantics(PerfCounters::default_ticks_semantics()));
   header.setSyscallbufProtocolVersion(SYSCALLBUF_PROTOCOL_VERSION);
+  header.setPreloadThreadLocalsRecorded(true);
   // Add a random UUID to the trace metadata. This lets tools identify a trace
   // easily.
   if (!uuid) {
@@ -1377,12 +1413,21 @@ TraceReader::TraceReader(const string& dir)
   trace_uses_cpuid_faulting = header.getHasCpuidFaulting();
   Data::Reader cpuid_records_bytes = header.getCpuidRecords();
   size_t len = cpuid_records_bytes.size() / sizeof(CPUIDRecord);
-  DEBUG_ASSERT(cpuid_records_bytes.size() == len * sizeof(CPUIDRecord));
+  if (cpuid_records_bytes.size() != len * sizeof(CPUIDRecord)) {
+    FATAL() << "Invalid CPUID records length";
+  }
   cpuid_records_.resize(len);
   memcpy(cpuid_records_.data(), cpuid_records_bytes.begin(),
          len * sizeof(CPUIDRecord));
   xcr0_ = header.getXcr0();
+  preload_thread_locals_recorded_ = header.getPreloadThreadLocalsRecorded();
   ticks_semantics_ = from_trace_ticks_semantics(header.getTicksSemantics());
+  Data::Reader uuid = header.getUuid();
+  uuid_ = unique_ptr<TraceUuid>(new TraceUuid());
+  if (uuid.size() != sizeof(uuid_->bytes)) {
+    FATAL() << "Invalid UUID length";
+  }
+  memcpy(uuid_->bytes, uuid.begin(), sizeof(uuid_->bytes));
 
   // Set the global time at 0, so that when we tick it for the first
   // event, it matches the initial global time at recording, 1.
@@ -1406,6 +1451,7 @@ TraceReader::TraceReader(const TraceReader& other)
   cpuid_records_ = other.cpuid_records_;
   raw_recs = other.raw_recs;
   xcr0_ = other.xcr0_;
+  preload_thread_locals_recorded_ = other.preload_thread_locals_recorded_;
 }
 
 TraceReader::~TraceReader() {}

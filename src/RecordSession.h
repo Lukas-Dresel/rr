@@ -64,15 +64,18 @@ public:
       const std::vector<std::string>& extra_env,
       const DisableCPUIDFeatures& features,
       SyscallBuffering syscallbuf = ENABLE_SYSCALL_BUF,
+      unsigned char syscallbuf_desched_sig = SIGPWR,
       BindCPU bind_cpu = BIND_CPU,
       const std::string& output_trace_dir = "",
-      const TraceUuid* trace_id = nullptr);
+      const TraceUuid* trace_id = nullptr,
+      bool use_audit = false);
 
   const DisableCPUIDFeatures& disable_cpuid_features() const {
     return disable_cpuid_features_;
   }
   bool use_syscall_buffer() const { return use_syscall_buffer_; }
   size_t syscall_buffer_size() const { return syscall_buffer_size_; }
+  unsigned char syscallbuf_desched_sig() const { return syscallbuf_desched_sig_; }
   bool use_read_cloning() const { return use_read_cloning_; }
   bool use_file_cloning() const { return use_file_cloning_; }
   void set_ignore_sig(int sig) { ignore_sig = sig; }
@@ -81,6 +84,8 @@ public:
   int get_continue_through_sig() const { return continue_through_sig; }
   void set_asan_active(bool active) { asan_active_ = active; }
   bool asan_active() const { return asan_active_; }
+  bool use_audit() const { return use_audit_; }
+  uint64_t rr_signal_mask() const;
 
   enum RecordStatus {
     // Some execution was recorded. record_step() can be called again.
@@ -183,9 +188,12 @@ private:
                 const std::vector<std::string>& argv,
                 const std::vector<std::string>& envp,
                 const DisableCPUIDFeatures& features,
-                SyscallBuffering syscallbuf, BindCPU bind_cpu,
+                SyscallBuffering syscallbuf,
+                int syscallbuf_desched_sig,
+                BindCPU bind_cpu,
                 const std::string& output_trace_dir,
-                const TraceUuid* trace_id);
+                const TraceUuid* trace_id,
+                bool use_audit);
 
   virtual void on_create(Task* t) override;
 
@@ -222,6 +230,7 @@ private:
   int continue_through_sig;
   Switchable last_task_switchable;
   size_t syscall_buffer_size_;
+  unsigned char syscallbuf_desched_sig_;
   bool use_syscall_buffer_;
 
   bool use_file_cloning_;
@@ -237,6 +246,8 @@ private:
   bool wait_for_all_;
 
   std::string output_trace_dir;
+
+  bool use_audit_;
 };
 
 } // namespace rr

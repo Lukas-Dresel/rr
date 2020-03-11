@@ -33,7 +33,7 @@ set(WILL_RUN_TESTS ${BUILD_TESTS} CACHE BOOL "Run tests")
 # debian is happy with it.  However, "_" is illegal in debs, while RPM
 # is cool with it.  Sigh.
 set(rr_VERSION_MAJOR 5)
-set(rr_VERSION_MINOR 2)
+set(rr_VERSION_MINOR 3)
 set(rr_VERSION_PATCH 0)
 
 add_definitions(-DRR_VERSION="${rr_VERSION_MAJOR}.${rr_VERSION_MINOR}.${rr_VERSION_PATCH}")
@@ -49,22 +49,49 @@ configure_file(
   ${CMAKE_BINARY_DIR}/git_revision.h
 )
 
-set(FLAGS_COMMON "-msse2 -D__MMX__ -D__SSE__ -D__SSE2__ -D__USE_LARGEFILE64 -pthread -g3")
+set(FLAGS_COMMON "-msse2 -D__MMX__ -D__SSE__ -D__SSE2__ -D__USE_LARGEFILE64 -pthread")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${FLAGS_COMMON} -Wstrict-prototypes -std=gnu11")
 # Define __STDC_LIMIT_MACROS so |#include <stdint.h>| works as expected.
 # Define __STDC_FORMAT_MACROS so |#include <inttypes.h>| works as expected.
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FLAGS_COMMON} -D__STDC_LIMIT_MACROS -D__STDC_FORMAT_MACROS -std=c++14")
-set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -g3")
+include(CheckCXXCompilerFlag)
+CHECK_CXX_COMPILER_FLAG("-std=c++14" SUPPORTS_CXX14)
+if (SUPPORTS_CXX14)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FLAGS_COMMON} -D__STDC_LIMIT_MACROS -D__STDC_FORMAT_MACROS -std=c++14")
+else()
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FLAGS_COMMON} -D__STDC_LIMIT_MACROS -D__STDC_FORMAT_MACROS -std=c++11")
+endif()
 
-set(RR_FLAGS_DEBUG "-Wall -Wextra -Werror -O0 -DDEBUG -UNDEBUG")
-set(RR_FLAGS_RELEASE "-Wall -Wextra -O2 -UDEBUG -DNDEBUG")
-set(RR_TEST_FLAGS "${RR_FLAGS_DEBUG}")
+# We support three build types:
+# DEBUG: suitable for debugging rr
+# RELEASE: suitable for using rr in production (but keeps rr debuginfo)
+# OTHER: suitable for using rr in production, but honouring distro/user opt/debug settings
+# (which we assume are suitable for production use)
 
+# Base settings for debug and release/unspecified builds.
+# Use -Werror for debug builds because we assume a developer is building, not a user.
+set(RR_FLAGS_DEBUG "-Wall -Wextra -DDEBUG -UNDEBUG")
+set(RR_FLAGS_RELEASE "-Wall -Wextra -UDEBUG -DNDEBUG")
+
+# The folowing settings are the defaults for the OTHER build type.
+# Flags used to build the preload library. MUST have debuginfo enabled. SHOULD be optimized.
+set(PRELOAD_COMPILE_FLAGS "${RR_FLAGS_RELEASE} -fno-stack-protector -g3")
+# Flags used to build Brotli. SHOULD be optimized. MUST NOT error on warnings.
+set(BROTLI_COMPILE_FLAGS ${RR_FLAGS_RELEASE})
+# Flags used to build tests. MUST have -DDEBUG and debuginfo enabled, MUST NOT be optimized.
+set(RR_TEST_FLAGS "${RR_FLAGS_DEBUG} -g3 -O0")
+# Flags used to build other files. Entirely build-type-dependent.
+set(RR_FLAGS ${RR_FLAGS_RELEASE})
+
+# Now override for build type.
 string(TOLOWER ${CMAKE_BUILD_TYPE} LOWERCASE_CMAKE_BUILD_TYPE)
 if(LOWERCASE_CMAKE_BUILD_TYPE STREQUAL "debug")
-  set(RR_FLAGS ${RR_FLAGS_DEBUG})
-else()
-  set(RR_FLAGS ${RR_FLAGS_RELEASE})
+  set(PRELOAD_COMPILE_FLAGS "${PRELOAD_COMPILE_FLAGS} -O2 -Werror")
+  set(BROTLI_COMPILE_FLAGS "${RR_FLAGS_RELEASE} -O2")
+  set(RR_TEST_FLAGS "${RR_TEST_FLAGS} -Werror")
+  set(RR_FLAGS "${RR_FLAGS_DEBUG} -g3 -Werror")
+elseif(LOWERCASE_CMAKE_BUILD_TYPE STREQUAL "release")
+  # CMake itself will add optimization flags
+  set(RR_FLAGS "${RR_FLAGS_RELEASE} -g3")
 endif()
 
 if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
@@ -229,7 +256,7 @@ set(BROTLI_FILES
 )
 add_library(brotli STATIC ${BROTLI_FILES})
 set_source_files_properties(${BROTLI_FILES}
-                            PROPERTIES COMPILE_FLAGS ${RR_FLAGS_RELEASE})
+                            PROPERTIES COMPILE_FLAGS ${BROTLI_COMPILE_FLAGS})
 # ==== brotli ====
 
 find_path(SECCOMP NAMES "linux/seccomp.h")
@@ -237,9 +264,8 @@ if(NOT SECCOMP)
   message(FATAL_ERROR "Couldn't find linux/seccomp.h. You may need to upgrade your kernel.")
 endif()
 
-# Check for Python >=2.7 but not Python 3.
-find_package(PythonInterp 3.0 QUIET)
-find_package(PythonInterp 2.7 REQUIRED)
+set(Python_ADDITIONAL_VERSIONS 3 3.8 3.7 3.6 3.5 3.4 3.3 3.2 3.1 3.0)
+find_package(PythonInterp 3 REQUIRED)
 
 execute_process(COMMAND "${PYTHON_EXECUTABLE}" "-c" "# nothing"
                 RESULT_VARIABLE python_status)
@@ -277,18 +303,6 @@ if(WILL_RUN_TESTS)
   endif()
 endif()
 
-set(PRELOAD_COMPILE_FLAGS "-fno-stack-protector")
-
-if (DEBUG_PRELOAD_LIB)
-  set(PRELOAD_COMPILE_FLAGS "${PRELOAD_COMPILE_FLAGS} ${RR_FLAGS_DEBUG}")
-else()
-  set(PRELOAD_COMPILE_FLAGS "${PRELOAD_COMPILE_FLAGS} ${RR_FLAGS_RELEASE}")
-endif()
-
-set_source_files_properties(src/preload/syscallbuf.c
-                            src/preload/overrides.c
-                            PROPERTIES COMPILE_FLAGS ${PRELOAD_COMPILE_FLAGS})
-
 include_directories("${PROJECT_SOURCE_DIR}/include")
 include_directories("${PROJECT_SOURCE_DIR}/third-party/proc-service")
 include_directories("${PROJECT_SOURCE_DIR}/third-party/brotli/include")
@@ -311,9 +325,30 @@ set(PRELOAD_SOURCE_FILES
 )
 add_library(rrpreload)
 foreach(file ${PRELOAD_FILES})
-  target_sources(rrpreload PUBLIC "src/preload/${file}")
+  target_sources(rrpreload PUBLIC "${CMAKE_SOURCE_DIR}/src/preload/${file}")
+  set_source_files_properties("${CMAKE_SOURCE_DIR}/src/preload/${file}"
+                              PROPERTIES COMPILE_FLAGS ${PRELOAD_COMPILE_FLAGS})
 endforeach(file)
 set_target_properties(rrpreload PROPERTIES LINK_FLAGS "-nostartfiles")
+
+set(AUDIT_FILES
+  rtld-audit.c
+  stap-note-iter.c
+  ../preload/raw_syscall.S
+)
+set(AUDIT_SOURCE_FILES
+  ${AUDIT_FILES}
+  rtld-audit.h
+  stap-note-iter.h
+  ../preload/preload_interface.h
+)
+add_library(rraudit)
+foreach(file ${AUDIT_FILES})
+  target_sources(rraudit PUBLIC "${CMAKE_SOURCE_DIR}/src/audit/${file}")
+  set_source_files_properties("${CMAKE_SOURCE_DIR}/src/audit/${file}"
+                              PROPERTIES COMPILE_FLAGS ${PRELOAD_COMPILE_FLAGS})
+endforeach(file)
+set_target_properties(rraudit PROPERTIES LINK_FLAGS "-nostartfiles -ldl")
 
 # Ensure that CMake knows about our generated files.
 #
@@ -343,28 +378,28 @@ endforeach(generated_file)
 
 add_custom_target(Generated DEPENDS ${GENERATED_FILES})
 
-add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64"
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_64"
                    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py"
-                   "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64"
+                   "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_64"
                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py")
-add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32"
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_32"
                    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py"
-                   "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32"
+                   "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_32"
                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py")
-add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64_replay"
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_64_replay"
                    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py"
-                   "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64_replay"
+                   "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_64_replay"
                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py")
-add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32_replay"
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_32_replay"
                    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py"
-                   "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32_replay"
+                   "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_32_replay"
                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/generate_rr_page.py")
 
 add_custom_target(Pages DEPENDS
-                  "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32"
-                  "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64"
-                  "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32_replay"
-                  "${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64_replay")
+                  "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_32"
+                  "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_64"
+                  "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_32_replay"
+                  "${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_64_replay")
 
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/rr_trace.capnp.c++"
                           "${CMAKE_CURRENT_BINARY_DIR}/rr_trace.capnp.h"
@@ -390,6 +425,7 @@ set(RR_SOURCES
   src/CPUIDBugDetector.cc
   src/DiversionSession.cc
   src/DumpCommand.cc
+  src/Dwarf.cc
   src/ElfReader.cc
   src/EmuFs.cc
   src/Event.cc
@@ -397,6 +433,7 @@ set(RR_SOURCES
   src/fast_forward.cc
   src/FdTable.cc
   src/FileMonitor.cc
+  src/FileNameCommand.cc
   src/Flags.cc
   src/ftrace.cc
   src/GdbCommand.cc
@@ -437,11 +474,13 @@ set(RR_SOURCES
   src/Scheduler.cc
   src/SeccompFilterRewriter.cc
   src/Session.cc
+  src/SourcesCommand.cc
   src/StdioMonitor.cc
   src/Task.cc
   src/ThreadGroup.cc
   src/ThreadDb.cc
   src/TraceFrame.cc
+  src/TraceInfoCommand.cc
   src/TraceStream.cc
   src/VirtualPerfCounterMonitor.cc
   src/util.cc
@@ -567,11 +606,14 @@ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/scripts/rr-collect-symbols.py"
 
 install(PROGRAMS scripts/signal-rr-recording.sh
                  scripts/rr-collect-symbols.py
-                 ${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64
-                 ${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64_replay
-                 ${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32
-                 ${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32_replay
   DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_64
+              ${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_64_replay
+              ${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_32
+              ${CMAKE_CURRENT_BINARY_DIR}/share/rr/rr_page_32_replay
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/rr)
+
 install(PROGRAMS scripts/rr_completion
   DESTINATION ${CMAKE_INSTALL_DATADIR}/bash-completion/completions RENAME rr)
 
@@ -580,7 +622,7 @@ install(TARGETS ${RR_BIN} rrpreload rr_exec_stub
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/rr
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}/rr)
 
-# Build 32-bit librrpreload on 64-bit builds.
+# Build 32-bit librrpreload and librraudit on 64-bit builds.
 # We copy the source files into '32' subdirectories in the output
 # directory, so we can set different compile options on them.
 # This sucks but I can't find a better way to get CMake to build
@@ -590,18 +632,37 @@ if(rr_32BIT AND rr_64BIT)
 
   foreach(file ${PRELOAD_SOURCE_FILES})
     configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/preload/${file}"
-                   "${CMAKE_CURRENT_BINARY_DIR}/32/${file}"
+                   "${CMAKE_CURRENT_BINARY_DIR}/32/preload/${file}"
                    COPYONLY)
   endforeach(file)
 
   foreach(file ${PRELOAD_FILES})
-    target_sources(rrpreload_32 PUBLIC "${CMAKE_CURRENT_BINARY_DIR}/32/${file}")
-    set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/32/${file}"
-                                PROPERTIES COMPILE_FLAGS "-m32 ${RR_FLAGS_RELEASE}")
+    target_sources(rrpreload_32 PUBLIC "${CMAKE_CURRENT_BINARY_DIR}/32/preload/${file}")
+    set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/32/preload/${file}"
+                                PROPERTIES COMPILE_FLAGS "-m32 ${PRELOAD_COMPILE_FLAGS}")
   endforeach(file)
 
   set_target_properties(rrpreload_32 PROPERTIES LINK_FLAGS "-m32 -nostartfiles")
   target_link_libraries(rrpreload_32
+    ${CMAKE_DL_LIBS}
+  )
+
+  add_library(rraudit_32)
+
+  foreach(file ${AUDIT_SOURCE_FILES})
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/audit/${file}"
+                   "${CMAKE_CURRENT_BINARY_DIR}/32/audit/${file}"
+                   COPYONLY)
+  endforeach(file)
+
+  foreach(file ${AUDIT_FILES})
+    target_sources(rraudit_32 PUBLIC "${CMAKE_CURRENT_BINARY_DIR}/32/audit/${file}")
+    set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/32/audit/${file}"
+                                PROPERTIES COMPILE_FLAGS "-m32 ${PRELOAD_COMPILE_FLAGS}")
+  endforeach(file)
+
+  set_target_properties(rraudit_32 PROPERTIES LINK_FLAGS "-m32 -nostartfiles")
+  target_link_libraries(rraudit_32
     ${CMAKE_DL_LIBS}
   )
 
@@ -618,7 +679,7 @@ if(rr_32BIT AND rr_64BIT)
   set_target_properties(rr_exec_stub_32
                         PROPERTIES LINK_FLAGS "-static -nostartfiles -nodefaultlibs -m32")
 
-  install(TARGETS rrpreload_32 rr_exec_stub_32
+  install(TARGETS rrpreload_32 rraudit_32 rr_exec_stub_32
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/rr
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}/rr)
@@ -640,6 +701,7 @@ endif()
 set(BASIC_TESTS
   64bit_child
   _llseek
+  abort
   accept
   acct
   adjtimex
@@ -682,6 +744,8 @@ set(BASIC_TESTS
   cwd_inaccessible
   daemon
   desched_blocking_poll
+  deterministic_sigsys
+  direct
   dup
   doublesegv
   epoll_create
@@ -715,6 +779,7 @@ set(BASIC_TESTS
   futex_priorities
   fxregs
   gdb_bogus_breakpoint
+  gcrypt_rdrand
   getcpu
   getgroups
   getpwnam
@@ -743,8 +808,10 @@ set(BASIC_TESTS
   ioctl
   ioctl_fs
   ioctl_pty
+  ioctl_sg
   ioctl_tty
   join_threads
+  joystick
   kcmp
   keyctl
   kill_newborn
@@ -757,6 +824,7 @@ set(BASIC_TESTS
   map_shared_syscall
   membarrier
   memfd_create
+  memfd_create_shared
   mincore
   mknod
   mlock
@@ -766,6 +834,7 @@ set(BASIC_TESTS
   mmap_ro
   mmap_self_maps_shared
   mmap_shared
+  mmap_shared_dev_zero
   mmap_shared_grow
   mmap_shared_grow_under_map
   mmap_shared_multiple
@@ -774,6 +843,7 @@ set(BASIC_TESTS
   mmap_shared_write_fork
   mmap_short_file
   mmap_tmpfs
+  mmap_write_complex
   mmap_zero_size_fd
   modify_ldt
   mount_ns_exec
@@ -835,6 +905,7 @@ set(BASIC_TESTS
   ptrace_debug_regs
   ptrace_exec
   ptrace_exec32
+  ptrace_kill_grandtracee
   ptrace_tls
   ptrace_seize
   ptrace_sigchld_blocked
@@ -869,7 +940,7 @@ set(BASIC_TESTS
   rusage
   samask
   save_data_fd
-  # sched_attr ... disabled since suitable headers are not widely available yet
+  sched_attr
   sched_setaffinity
   sched_setparam
   sched_yield
@@ -1074,7 +1145,9 @@ set(TESTS_WITH_PROGRAM
   main_thread_exit
   mmap_replace_most_mappings
   mmap_shared_prot
+  mmap_shared_write_exec_race
   mmap_write
+  mmap_write_private
   mprotect_growsdown
   mprotect_syscallbuf_overflow
   mutex_pi_stress
@@ -1102,6 +1175,8 @@ set(TESTS_WITH_PROGRAM
   shared_persistent_file
   signal_numbers
   sigprocmask_race
+  sigprocmask_rr_sigs_nondefault
+  singlestep_pushf
   stack_growth
   step_thread
   string_instructions
@@ -1188,7 +1263,6 @@ set(TESTS_WITHOUT_PROGRAM
   final_sigkill
   first_instruction
   fork_exec_info_thr
-  gcrypt_rdrand
   get_thread_list
   hardlink_mmapped_files
   hbreak

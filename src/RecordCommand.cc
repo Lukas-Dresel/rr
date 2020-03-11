@@ -67,6 +67,9 @@ RecordCommand RecordCommand::singleton(
     "                             to given file descriptor\n"
     "  --syscall-buffer-size=<NUM> desired size of syscall buffer in kB.\n"
     "                             Mainly for tests\n"
+    "  --syscall-buffer-sig=<NUM> the signal used for communication with the\n"
+    "                             syscall buffer. SIGPWR by default, unused\n"
+    "                             if --no-syscall-buffer is passed\n"
     "  -s, --always-switch        try to context switch at every rr event\n"
     "  -t, --continue-through-signal=<SIG>\n"
     "                             Unhandled <SIG> signals will be ignored\n"
@@ -93,7 +96,9 @@ RecordCommand RecordCommand::singleton(
     "                             user that ran sudo rather than root. This\n"
     "                             allows recording setuid/setcap binaries.\n"
     "  --trace-id                 Sets the trace id to the specified id.\n"
-    "  --copy-preload-src         Copy preload sources to trace dir\n");
+    "  --copy-preload-src         Copy preload sources to trace dir\n"
+    "  --stap-sdt                 Enables the use of SystemTap statically-\n"
+    "                             defined tracepoints\n");
 
 struct RecordFlags {
   vector<string> extra_env;
@@ -158,6 +163,12 @@ struct RecordFlags {
   /* Copy preload sources to trace dir */
   bool copy_preload_src;
 
+  /* The signal to use for syscallbuf desched events */
+  int syscallbuf_desched_sig;
+
+  /* True if we should load the audit library for SystemTap SDT support. */
+  bool stap_sdt;
+
   RecordFlags()
       : max_ticks(Scheduler::DEFAULT_MAX_TICKS),
         ignore_sig(0),
@@ -176,7 +187,9 @@ struct RecordFlags {
         ignore_nested(false),
         scarce_fds(false),
         setuid_sudo(false),
-        copy_preload_src(false) {}
+        copy_preload_src(false),
+        syscallbuf_desched_sig(SYSCALLBUF_DEFAULT_DESCHED_SIGNAL),
+        stap_sdt(false) {}
 };
 
 static void parse_signal_name(ParsedOption& opt) {
@@ -232,6 +245,8 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
     { 10, "num-cores", HAS_PARAMETER },
     { 11, "trace-id", HAS_PARAMETER },
     { 12, "copy-preload-src", NO_PARAMETER },
+    { 13, "syscall-buffer-sig", HAS_PARAMETER },
+    { 14, "stap-sdt", NO_PARAMETER },
     { 'b', "force-syscall-buffer", NO_PARAMETER },
     { 'c', "num-cpu-ticks", HAS_PARAMETER },
     { 'h', "chaos", NO_PARAMETER },
@@ -416,6 +431,16 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
     case 12:
       flags.copy_preload_src = true;
       break;
+    case 13:
+      parse_signal_name(opt);
+      if (!opt.verify_valid_int(1, _NSIG - 1)) {
+        return false;
+      }
+      flags.syscallbuf_desched_sig = opt.int_value;
+      break;
+    case 14:
+      flags.stap_sdt = true;
+      break;
     case 's':
       flags.always_switch = true;
       break;
@@ -475,7 +500,10 @@ static void install_signal_handlers(void) {
   sigaction(SIGTERM, &sa, nullptr);
 
   sa.sa_handler = SIG_IGN;
+  sigaction(SIGHUP, &sa, nullptr);
   sigaction(SIGINT, &sa, nullptr);
+  sigaction(SIGABRT, &sa, nullptr);
+  sigaction(SIGQUIT, &sa, nullptr);
 }
 
 static void setup_session_from_flags(RecordSession& session,
@@ -548,7 +576,10 @@ static void save_rr_git_revision(const string& trace_dir) {
   mkdir(files_dir.c_str(), 0700);
   string dest_path = files_dir + "/rr_git_revision";
   ScopedFd fd(dest_path.c_str(), O_CREAT | O_WRONLY, 0600);
-  write(fd, GIT_REVISION, sizeof(GIT_REVISION) - 1);
+  ssize_t written = write(fd, GIT_REVISION, sizeof(GIT_REVISION) - 1);
+  if (written != sizeof(GIT_REVISION) - 1) {
+    FATAL() << "Can't write GIT_REVISION";
+  }
 }
 
 static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
@@ -556,8 +587,10 @@ static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
 
   auto session = RecordSession::create(
       args, flags.extra_env, flags.disable_cpuid_features,
-      flags.use_syscall_buffer, flags.bind_cpu, flags.output_trace_dir,
-      flags.trace_id.get());
+      flags.use_syscall_buffer, flags.syscallbuf_desched_sig,
+      flags.bind_cpu, flags.output_trace_dir,
+      flags.trace_id.get(),
+      flags.stap_sdt);
   setup_session_from_flags(*session, flags);
 
   static_session = session.get();
